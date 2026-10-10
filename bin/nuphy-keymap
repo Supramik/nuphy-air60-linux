@@ -182,6 +182,10 @@ class Busy(Exception):
     """Another program (normally VIA in the browser) has the keyboard open."""
 
 
+class NotPluggedIn(Exception):
+    """No VIA interface: the keyboard is off, or on Bluetooth or the 2.4G dongle."""
+
+
 VIA_RAW_HID = (b"\x06\x60\xff", b"\x09\x61")  # HID usage page 0xFF60, usage 0x61
 
 
@@ -260,7 +264,7 @@ def read_keyboard(board: Board) -> tuple[list[list[str]], int]:
     """Read every layer straight from the keyboard. Returns (layers, VIA protocol)."""
     dev = find_via_hidraw(board)
     if dev is None:
-        raise FileNotFoundError("not plugged in by USB")
+        raise NotPluggedIn("not plugged in by USB")
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with open(RUNTIME_DIR / "nuphy-keymap-hid.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)  # one reader of ours at a time
@@ -293,7 +297,7 @@ def get_keymap(board: Board, live: bool = True) -> Keymap:
             path, _ = save_snapshot(board, layers, protocol)
             saved = read_layout_file(path, board)
             return Keymap(layers, "usb", path, dt.datetime.now(), saved.macros)
-        except FileNotFoundError:
+        except NotPluggedIn:
             pass
         except Busy as e:
             note = f"{e} has the keyboard open (VIA?), so this is the last snapshot"
@@ -1653,6 +1657,8 @@ def sync(board: Board, watch: bool):
                 next_read = now + WATCH_REREAD
             except Busy:
                 pass  # VIA grabbed it in between; try again next round
+            except NotPluggedIn:
+                break  # the cable came out in between
             except (OSError, TimeoutError, RuntimeError) as e:
                 print(f"read failed: {e}", file=sys.stderr)
                 next_read = now + 30
@@ -1660,13 +1666,13 @@ def sync(board: Board, watch: bool):
 
 
 def verify(board: Board, against: Path | None):
-    layers, protocol = read_keyboard(board)
     if against:
         ref = read_layout_file(against, board)
     else:
         ref = next((k for k in saved_keymaps(board) if k.source == "export"), None)
         if ref is None:
             sys.exit("No VIA export in via/ to compare with.")
+    layers, protocol = read_keyboard(board)
     print(f"Keyboard: {len(layers)} layers, VIA protocol {protocol}. Comparing with {ref.path.name}")
     diffs = [(li, k, ref.layers[li][k.idx], layers[li][k.idx])
              for li in range(min(len(layers), len(ref.layers))) for k in board.keys
@@ -1711,10 +1717,12 @@ def main(argv: list[str] | None = None):
         if cmd == "verify":
             return verify(board, args.file)
         km = get_keymap(board, live=not args.offline)
-    except FileNotFoundError:
+    except NotPluggedIn:
         sys.exit("The keyboard isn't plugged in by USB, which VIA needs.")
     except Busy as e:
         sys.exit(f"{e} has the keyboard open. Close VIA and try again.")
+    except FileNotFoundError as e:
+        sys.exit(f"Can't find {e.filename}.")
     conns = connections(board)
     if cmd == "text":
         return print_text(board, km, conns)

@@ -155,5 +155,14 @@ class Saving(unittest.TestCase):
         self.assertIn('"name":"Toy Board"', fragment.read_text())
 
 
+class Errors(unittest.TestCase):
+    def test_a_missing_file_is_named_not_blamed_on_usb(self):
+        make_board()
+        missing = DATA / "missing.layout.json"
+        with self.assertRaises(SystemExit) as caught:
+            nk.main(["verify", str(missing)])
+        self.assertEqual(caught.exception.code, f"Can't find {missing}.")
+
+
 if __name__ == "__main__":
     unittest.main()
