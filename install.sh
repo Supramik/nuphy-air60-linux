@@ -8,7 +8,8 @@
 #
 # Add --remove to undo a step. Steps that need root ask for your password (sudo in a
 # terminal, the desktop's password dialog otherwise) and are skipped when the installed
-# files already match. The viewer runs from this folder, so keep the folder where it is.
+# files already match. The viewer runs from this folder, so keep the folder where it is,
+# or run its steps again after moving it.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,8 +32,26 @@ refresh_menu() { if command -v kbuildsycoca6 >/dev/null; then kbuildsycoca6 >/de
 
 plugged_in() { grep -qsi "$usb_id" /sys/class/hidraw/hidraw*/device/uevent; }
 
+# True while KDE's shortcut daemon (kglobalaccel, part of KWin) has the viewer's shortcut.
+has_shortcut() {
+    [[ "$(busctl --user call org.kde.kglobalaccel /kglobalaccel org.kde.KGlobalAccel allComponents 2>/dev/null)" \
+        == *'"/component/nuphy_keymap_desktop"'* ]]
+}
+
 install_viewer() {
     mkdir -p "$data/via" "$data/snapshots" "$apps"
+    # KWin reads the launcher once, when it registers the shortcut, and after that only
+    # notices launchers that appear or disappear, never one that changes. So take the old
+    # one away and wait for its shortcut to go, or the shortcut keeps running the old
+    # command (say, from where this folder used to be) until you log out. Keys you set
+    # in System Settings are kept.
+    local stale=
+    if [ -f "$apps/nuphy-keymap.desktop" ] && has_shortcut; then
+        rm "$apps/nuphy-keymap.desktop"
+        refresh_menu
+        stale=1
+        for _ in $(seq 50); do has_shortcut || { stale=; break; }; sleep 0.1; done
+    fi
     render nuphy-keymap.desktop "$apps/nuphy-keymap.desktop"
     refresh_menu
     if ! same_rule "$repo/system/50-nuphy.rules" "$rules/50-nuphy.rules"; then
@@ -41,6 +60,9 @@ install_viewer() {
             udevadm trigger --subsystem-match=hidraw' sh "$repo/system/50-nuphy.rules" "$rules/50-nuphy.rules"
     fi
     echo "Viewer installed: Meta+Shift+K (or F19) shows the keymap."
+    if [ -n "$stale" ]; then
+        echo "KDE is still holding on to the old shortcut; log out and back in to use the new one."
+    fi
     if [ ! -f "$data/via/definition.json" ]; then
         echo "Next: download NuPhy's VIA file for your keyboard from"
         echo "  https://nuphy.com/pages/json-files-for-nuphy-keyboards"
@@ -111,7 +133,7 @@ remove_toggle() {
 
 case "${1:-}" in
     viewer | usb-hook | toggle) ;;
-    *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
 step="${1//-/_}"
 if [ "${2:-}" = "--remove" ]; then "remove_$step"; else "install_$step"; fi

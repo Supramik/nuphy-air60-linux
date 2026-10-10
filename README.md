@@ -44,7 +44,7 @@ cd ~/Projects/nuphy-air60-linux
 ./install.sh viewer
 ```
 
-The shortcut runs the script from the folder you cloned, so leave it there.
+The shortcut runs the script from the folder you cloned, so leave it there. If you do move it, run `./install.sh viewer` again from the new place (and `./install.sh usb-hook`, if you use it); otherwise the shortcut says it can't find the program.
 
 Then download NuPhy's VIA file for the Air60 V2 from [JSON files for NuPhy keyboards](https://nuphy.com/pages/json-files-for-nuphy-keyboards), the same file you load into VIA's Design tab, and save it as `~/.config/nuphy-air60/via/definition.json`. Plug the keyboard in by USB once so nuphy-keymap can read your layers.
 
