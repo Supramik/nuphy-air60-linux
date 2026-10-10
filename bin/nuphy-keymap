@@ -361,7 +361,7 @@ def _basic_names(protocol: int) -> dict[int, str]:
              "KC_MS_BTN1", "KC_MS_BTN2", "KC_MS_BTN3", "KC_MS_BTN4", "KC_MS_BTN5"]
     wheel = ["KC_MS_WH_UP", "KC_MS_WH_DOWN", "KC_MS_WH_LEFT", "KC_MS_WH_RIGHT",
              "KC_MS_ACCEL0", "KC_MS_ACCEL1", "KC_MS_ACCEL2"]
-    if protocol >= 12:  # QMK 0.19+ renumbered the mouse keys
+    if protocol >= 11:  # QMK 0.19+ renumbered the mouse keys
         t.update({0xBF: "KC_CPNL", 0xC0: "KC_ASST", 0xC1: "KC_MCTL", 0xC2: "KC_LPAD"})
         t.update({0xCD + i: n for i, n in enumerate(mouse)})
         t.update({0xD6: "KC_MS_BTN6", 0xD7: "KC_MS_BTN7", 0xD8: "KC_MS_BTN8"})
@@ -391,10 +391,12 @@ def _mods(bits: int) -> list[str]:
 
 
 def keycode_decoder(protocol: int):
-    """VIA protocol 12+ (QMK 0.19 and later) uses QMK's current numbering;
-    older firmware uses the "v10" layout. Unknown values come back as hex."""
+    """VIA protocol 11+ (QMK 0.19 and later) uses QMK's current numbering, though
+    11 kept macros and custom keycodes higher up; older firmware uses the "v10"
+    layout. Unknown values come back as hex."""
     basic = _basic_names(protocol)
-    v12 = protocol >= 12
+    modern = protocol >= 11
+    macro, custom = (0x7700, 0x7E00) if protocol >= 12 else (0x7702, 0x7F00)
 
     def kc(b: int) -> str:
         return basic.get(b, f"0x{b:02x}")
@@ -412,7 +414,7 @@ def keycode_decoder(protocol: int):
             return name
         if 0x4000 <= code <= 0x4FFF:
             return f"LT({code >> 8 & 0xF},{kc(code & 0xFF)})"
-        if v12:
+        if modern:
             if 0x2000 <= code <= 0x3FFF:
                 return f"MT({mask(code >> 8 & 0x1F)},{kc(code & 0xFF)})"
             if 0x5000 <= code <= 0x51FF:
@@ -423,10 +425,10 @@ def keycode_decoder(protocol: int):
                     return f"{op}({code - start})"
             if 0x52A0 <= code <= 0x52BF:
                 return f"OSM({mask(code & 0x1F)})"
-            if 0x7700 <= code <= 0x771F:
-                return f"MACRO({code - 0x7700})"
-            if 0x7E00 <= code <= 0x7E1F:
-                return f"CUSTOM({code - 0x7E00})"
+            if macro <= code < macro + 0x20:
+                return f"MACRO({code - macro})"
+            if custom <= code < custom + 0x20:
+                return f"CUSTOM({code - custom})"
             return NAMED_V12.get(code, f"0x{code:04x}")
         if 0x6000 <= code <= 0x7FFF:
             return f"MT({mask(code >> 8 & 0x1F)},{kc(code & 0xFF)})"

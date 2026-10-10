@@ -89,6 +89,11 @@ class Keycodes(unittest.TestCase):
             0x7700: "MACRO(0)", 0x0A0E: "LSFT(LGUI(KC_K))", 0x7FFF: "0x7fff",
         })
 
+    def test_via_protocol_11(self):
+        # QMK 0.19's numbering, like 12, but with macros and custom keycodes higher up
+        self.check(11, {0x5221: "MO(1)", 0x2204: "MT(MOD_LSFT,KC_A)", 0x00CD: "KC_MS_UP",
+                        0x7820: "RGB_TOG", 0x7702: "MACRO(0)", 0x7F00: "CUSTOM(0)"})
+
     def test_via_protocol_10(self):
         self.check(10, {0x5101: "MO(1)", 0x00F0: "KC_MS_UP", 0x5F80: "CUSTOM(0)", 0x5CC2: "RGB_TOG"})
 
