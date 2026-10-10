@@ -1,0 +1,13 @@
+[Unit]
+Description=Re-enable internal keyboard after resume
+Documentation=man:systemd-suspend.service(8)
+# suspend.target's job completes on resume, so ordering After= it means this
+# runs once the machine is awake again.
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/toggle-internal-keyboard on
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

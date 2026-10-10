@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep the NuPhy Air60 keymap snapshot current while it's plugged in by USB
+Documentation=https://github.com/Supramik/nuphy-air60-linux
+
+[Service]
+Type=simple
+# Exits on its own when the cable comes out; the udev rule starts it again.
+ExecStart="@BIN@/nuphy-keymap" sync --watch

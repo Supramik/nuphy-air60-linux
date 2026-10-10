@@ -1,0 +1,1743 @@
+#!/usr/bin/python3
+"""nuphy-keymap - a visual, always-current cheat sheet for the NuPhy Air60 V2.
+
+  nuphy-keymap               toggle the on-screen overlay (this is what the shortcut runs)
+  nuphy-keymap html [FILE]   write the same view as an interactive web page
+  nuphy-keymap text          print every layer in the terminal
+  nuphy-keymap sync          read the keyboard over USB and save a snapshot
+  nuphy-keymap verify        compare the live keyboard with the newest VIA export
+
+Nothing about the keymap is hard-coded. Every run uses the freshest source:
+
+  1. the keyboard itself, read over USB with the VIA protocol. Read-only, and
+     possible without root thanks to the udev rule in system/50-nuphy.rules.
+  2. the newest snapshot in snapshots/. Every live read refreshes it, so this
+     is what you see over Bluetooth or the 2.4G dongle, which VIA can't reach.
+  3. a VIA export (Save + Load > Save Current Layout) dropped into via/.
+
+The physical layout and NuPhy's custom key names come from via/definition.json,
+the same definition file VIA loads. These live in ~/.config/nuphy-air60, or in
+$NUPHY_KEYMAP_HOME if that's set.
+"""
+from __future__ import annotations
+
+import argparse
+import colorsys
+import datetime as dt
+import fcntl
+import html
+import json
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+
+DATA_DIR = Path(os.environ.get("NUPHY_KEYMAP_HOME")
+                or Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "nuphy-air60")
+VIA_DIR = DATA_DIR / "via"
+DEFINITION_FILE = VIA_DIR / "definition.json"
+SNAPSHOT_DIR = DATA_DIR / "snapshots"
+STATE_FILE = DATA_DIR / "state.json"
+HTML_FILE = DATA_DIR / "keymap.html"
+DEFINITIONS_URL = "https://nuphy.com/pages/json-files-for-nuphy-keyboards"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+KEEP_SNAPSHOTS = 25
+WATCH_POLL = 5  # sync --watch: seconds between checks of who has the keyboard open
+WATCH_REREAD = 300  # ...and re-read at least this often, for changes made without VIA
+
+
+# ---------------------------------------------------------------------------
+# The board: physical layout from VIA's definition (KLE format)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PhysKey:
+    idx: int  # position in VIA's flat per-layer list: row * cols + col
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+@dataclass
+class Board:
+    name: str
+    vid: int
+    pid: int
+    rows: int
+    cols: int
+    keys: list[PhysKey]
+    custom: list[dict]  # VIA customKeycodes, indexed by CUSTOM(n)
+
+    @property
+    def width(self) -> float:
+        return max(k.x + k.w for k in self.keys)
+
+    @property
+    def height(self) -> float:
+        return max(k.y + k.h for k in self.keys)
+
+
+def load_board(path: Path = DEFINITION_FILE) -> Board:
+    d = json.loads(path.read_text())
+    rows, cols = d["matrix"]["rows"], d["matrix"]["cols"]
+    keys: list[PhysKey] = []
+    y = 0.0
+    for row in d["layouts"]["keymap"]:
+        x, w, h, decal = 0.0, 1.0, 1.0, False
+        for item in row:
+            if isinstance(item, dict):  # properties for the next key
+                x += item.get("x", 0)
+                y += item.get("y", 0)
+                w, h = item.get("w", w), item.get("h", h)
+                decal = item.get("d", decal)
+                continue
+            legend = str(item).split("\n")
+            option = legend[3] if len(legend) > 3 else ""  # VIA layout option "group,choice"
+            if not decal and (not option or option.endswith(",0")):
+                r, c = (int(v) for v in legend[0].split(","))
+                keys.append(PhysKey(r * cols + c, x, y, w, h))
+            x += w
+            w, h, decal = 1.0, 1.0, False
+        y += 1
+    return Board(d["name"], int(d["vendorId"], 16), int(d["productId"], 16),
+                 rows, cols, keys, d.get("customKeycodes", []))
+
+
+# ---------------------------------------------------------------------------
+# Where the keymap comes from
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Keymap:
+    layers: list[list[str]]  # VIA keycode names, one list per layer
+    source: str  # "usb", "snapshot" or "export"
+    path: Path | None
+    when: dt.datetime  # when this keymap was last known to be on the keyboard
+    macros: list[str] = field(default_factory=list)
+    note: str = ""  # why a live read didn't happen, when that's worth saying
+
+
+def read_layout_file(path: Path, board: Board) -> Keymap:
+    data = json.loads(path.read_text())
+    vpid = data.get("vendorProductId")
+    if vpid is not None and vpid != board.vid << 16 | board.pid:
+        raise ValueError(f"{path.name} is for a different keyboard")
+    layers = data.get("layers") or []
+    if not layers or any(len(layer) != board.rows * board.cols for layer in layers):
+        raise ValueError(f"{path.name} doesn't match the {board.rows}x{board.cols} matrix")
+    source = "snapshot" if path.parent == SNAPSHOT_DIR else "export"
+    when = dt.datetime.fromtimestamp(path.stat().st_mtime)
+    return Keymap(layers, source, path, when, data.get("macros") or [])
+
+
+def saved_keymaps(board: Board):
+    """Snapshots and VIA exports, newest first."""
+    files = [p for p in (*SNAPSHOT_DIR.glob("*.json"), *VIA_DIR.glob("*.json"))
+             if p != DEFINITION_FILE]
+    for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            yield read_layout_file(path, board)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+
+
+def save_snapshot(board: Board, layers: list[list[str]], protocol: int) -> tuple[Path, bool]:
+    """Store a live read. Returns (path, whether the keymap changed)."""
+    latest = next(saved_keymaps(board), None)
+    changed = latest is None or latest.layers != layers
+    if latest and latest.source == "snapshot" and not changed:
+        os.utime(latest.path)  # same keymap: just mark it as confirmed now
+        return latest.path, False
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    now = dt.datetime.now()
+    path = SNAPSHOT_DIR / f"keymap-{now:%Y-%m-%d_%H%M%S}.layout.json"
+    data = {  # VIA's own layout format, plus a note on where it came from
+        "name": board.name,
+        "vendorProductId": board.vid << 16 | board.pid,
+        "macros": latest.macros if latest else [],
+        "layers": layers,
+        "encoders": [],
+        "_nuphy_keymap": {
+            "read": f"live over USB, VIA protocol {protocol}",
+            "at": now.isoformat(timespec="seconds"),
+            "macros": "carried over from the previous file, not read from the keyboard",
+        },
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+    for old in sorted(SNAPSHOT_DIR.glob("keymap-*.layout.json"))[:-KEEP_SNAPSHOTS]:
+        old.unlink(missing_ok=True)
+    return path, changed
+
+
+class Busy(Exception):
+    """Another program (normally VIA in the browser) has the keyboard open."""
+
+
+VIA_RAW_HID = (b"\x06\x60\xff", b"\x09\x61")  # HID usage page 0xFF60, usage 0x61
+
+
+def find_via_hidraw(board: Board) -> Path | None:
+    """The keyboard's VIA interface, present only when it's plugged in by USB."""
+    for node in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        try:
+            uevent = (node / "device" / "uevent").read_text()
+            m = re.search(r"^HID_ID=(\w+):(\w+):(\w+)$", uevent, re.M)
+            if not m or tuple(int(g, 16) for g in m.groups()) != (0x03, board.vid, board.pid):
+                continue
+            descriptor = (node / "device" / "report_descriptor").read_bytes()
+        except OSError:
+            continue
+        if all(part in descriptor for part in VIA_RAW_HID):
+            return Path("/dev") / node.name
+    return None
+
+
+def processes_using(dev: Path) -> list[str]:
+    """Names of other processes holding dev open. Replies to a VIA request go
+    to every reader, so querying while VIA is connected would confuse it."""
+    me, target, users = os.getpid(), str(dev), []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit() or int(proc.name) == me:
+            continue
+        try:
+            fds = list((proc / "fd").iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(fd) == target:
+                    users.append((proc / "comm").read_text().strip())
+                    break
+            except OSError:
+                pass
+    return users
+
+
+class ViaLink:
+    """Minimal read-only VIA client: 32-byte raw HID reports over hidraw."""
+
+    def __init__(self, dev: Path):
+        self.fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)
+        while self._read() is not None:  # drop anything already queued
+            pass
+
+    def close(self):
+        os.close(self.fd)
+
+    def _read(self) -> bytes | None:
+        try:
+            return os.read(self.fd, 64)
+        except BlockingIOError:
+            return None
+
+    def ask(self, *request: int, echo: int = 1, timeout: float = 0.8) -> bytes:
+        msg = bytes(request).ljust(32, b"\0")
+        os.write(self.fd, b"\0" + msg)  # the leading 0 is the (unused) report ID
+        deadline = time.monotonic() + timeout
+        while (left := deadline - time.monotonic()) > 0:
+            if not select.select([self.fd], [], [], left)[0]:
+                break
+            reply = self._read()
+            if not reply:
+                continue
+            if reply[0] == 0xFF and reply[1:echo] == msg[1:echo]:
+                raise RuntimeError(f"the keyboard doesn't support VIA command 0x{request[0]:02x}")
+            if reply[:echo] == msg[:echo]:
+                return reply
+        raise TimeoutError("the keyboard didn't answer")
+
+
+def read_keyboard(board: Board) -> tuple[list[list[str]], int]:
+    """Read every layer straight from the keyboard. Returns (layers, VIA protocol)."""
+    dev = find_via_hidraw(board)
+    if dev is None:
+        raise FileNotFoundError("not plugged in by USB")
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RUNTIME_DIR / "nuphy-keymap-hid.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # one reader of ours at a time
+        if users := processes_using(dev):
+            raise Busy(", ".join(sorted(set(users))))
+        link = ViaLink(dev)
+        try:
+            reply = link.ask(0x01)  # id_get_protocol_version
+            protocol = reply[1] << 8 | reply[2]
+            count = link.ask(0x11)[1]  # id_dynamic_keymap_get_layer_count
+            size = count * board.rows * board.cols * 2
+            raw = bytearray()
+            for offset in range(0, size, 28):  # id_dynamic_keymap_get_buffer, 28 bytes a time
+                n = min(28, size - offset)
+                reply = link.ask(0x12, offset >> 8, offset & 0xFF, n, echo=3)
+                raw += reply[4:4 + n]
+        finally:
+            link.close()
+    decode = keycode_decoder(protocol)
+    codes = [decode(raw[i] << 8 | raw[i + 1]) for i in range(0, len(raw), 2)]
+    per_layer = board.rows * board.cols
+    return [codes[i:i + per_layer] for i in range(0, len(codes), per_layer)], protocol
+
+
+def get_keymap(board: Board, live: bool = True) -> Keymap:
+    note = ""
+    if live:
+        try:
+            layers, protocol = read_keyboard(board)
+            path, _ = save_snapshot(board, layers, protocol)
+            saved = read_layout_file(path, board)
+            return Keymap(layers, "usb", path, dt.datetime.now(), saved.macros)
+        except FileNotFoundError:
+            pass
+        except Busy as e:
+            note = f"{e} has the keyboard open (VIA?), so this is the last snapshot"
+        except (OSError, TimeoutError, RuntimeError) as e:
+            note = f"couldn't read it over USB: {e}"
+    km = next(saved_keymaps(board), None)
+    if km is None:
+        sys.exit(f"No keymap yet. Plug the keyboard in by USB once, or put a VIA export in {VIA_DIR}")
+    km.note = note
+    return km
+
+
+def connections(board: Board) -> list[str]:
+    """How the keyboard is attached right now, from the kernel's input devices."""
+    try:
+        text = Path("/proc/bus/input/devices").read_text()
+    except OSError:
+        return []
+    found: list[str] = []
+    for block in text.split("\n\n"):
+        m = re.search(r"Bus=(\w{4}) Vendor=(\w{4}) Product=(\w{4})", block)
+        if not m or int(m.group(2), 16) != board.vid:
+            continue
+        bus, pid = int(m.group(1), 16), int(m.group(3), 16)
+        kind = ("Bluetooth" if bus == 0x05 else "USB" if pid == board.pid
+                else "2.4G dongle" if bus == 0x03 else "")
+        if kind and kind not in found:
+            found.append(kind)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Keycodes: 16-bit values from the keyboard -> the names VIA uses in exports
+# ---------------------------------------------------------------------------
+
+def _basic_names(protocol: int) -> dict[int, str]:
+    t = {0x00: "KC_NO", 0x01: "KC_TRNS"}
+    t.update({0x04 + i: f"KC_{c}" for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ")})
+    t.update({0x1E + i: f"KC_{c}" for i, c in enumerate("1234567890")})
+    t.update({0x3A + i: f"KC_F{i + 1}" for i in range(12)})
+    t.update({0x68 + i: f"KC_F{i + 13}" for i in range(12)})
+    t.update({0x59 + i: f"KC_P{i + 1}" for i in range(9)})
+    t.update({
+        0x28: "KC_ENT", 0x29: "KC_ESC", 0x2A: "KC_BSPC", 0x2B: "KC_TAB", 0x2C: "KC_SPC",
+        0x2D: "KC_MINS", 0x2E: "KC_EQL", 0x2F: "KC_LBRC", 0x30: "KC_RBRC", 0x31: "KC_BSLS",
+        0x32: "KC_NUHS", 0x33: "KC_SCLN", 0x34: "KC_QUOT", 0x35: "KC_GRV", 0x36: "KC_COMM",
+        0x37: "KC_DOT", 0x38: "KC_SLSH", 0x39: "KC_CAPS", 0x46: "KC_PSCR", 0x47: "KC_SLCK",
+        0x48: "KC_PAUS", 0x49: "KC_INS", 0x4A: "KC_HOME", 0x4B: "KC_PGUP", 0x4C: "KC_DEL",
+        0x4D: "KC_END", 0x4E: "KC_PGDN", 0x4F: "KC_RGHT", 0x50: "KC_LEFT", 0x51: "KC_DOWN",
+        0x52: "KC_UP", 0x53: "KC_NLCK", 0x54: "KC_PSLS", 0x55: "KC_PAST", 0x56: "KC_PMNS",
+        0x57: "KC_PPLS", 0x58: "KC_PENT", 0x62: "KC_P0", 0x63: "KC_PDOT", 0x64: "KC_NUBS",
+        0x65: "KC_APP", 0x66: "KC_POWER", 0x67: "KC_PEQL", 0x74: "KC_EXEC", 0x75: "KC_HELP",
+        0x76: "KC_MENU", 0x77: "KC_SLCT", 0x78: "KC_STOP", 0x79: "KC_AGIN", 0x7A: "KC_UNDO",
+        0x7B: "KC_CUT", 0x7C: "KC_COPY", 0x7D: "KC_PSTE", 0x7E: "KC_FIND",
+        0xA5: "KC_PWR", 0xA6: "KC_SLEP", 0xA7: "KC_WAKE", 0xA8: "KC_MUTE", 0xA9: "KC_VOLU",
+        0xAA: "KC_VOLD", 0xAB: "KC_MNXT", 0xAC: "KC_MPRV", 0xAD: "KC_MSTP", 0xAE: "KC_MPLY",
+        0xAF: "KC_MSEL", 0xB0: "KC_EJCT", 0xB1: "KC_MAIL", 0xB2: "KC_CALC", 0xB3: "KC_MYCM",
+        0xB4: "KC_WSCH", 0xB5: "KC_WHOM", 0xB6: "KC_WBAK", 0xB7: "KC_WFWD", 0xB8: "KC_WSTP",
+        0xB9: "KC_WREF", 0xBA: "KC_WFAV", 0xBB: "KC_MFFD", 0xBC: "KC_MRWD", 0xBD: "KC_BRIU",
+        0xBE: "KC_BRID",
+        0xE0: "KC_LCTL", 0xE1: "KC_LSFT", 0xE2: "KC_LALT", 0xE3: "KC_LGUI",
+        0xE4: "KC_RCTL", 0xE5: "KC_RSFT", 0xE6: "KC_RALT", 0xE7: "KC_RGUI",
+    })
+    mouse = ["KC_MS_UP", "KC_MS_DOWN", "KC_MS_LEFT", "KC_MS_RIGHT",
+             "KC_MS_BTN1", "KC_MS_BTN2", "KC_MS_BTN3", "KC_MS_BTN4", "KC_MS_BTN5"]
+    wheel = ["KC_MS_WH_UP", "KC_MS_WH_DOWN", "KC_MS_WH_LEFT", "KC_MS_WH_RIGHT",
+             "KC_MS_ACCEL0", "KC_MS_ACCEL1", "KC_MS_ACCEL2"]
+    if protocol >= 12:  # QMK 0.19+ renumbered the mouse keys
+        t.update({0xBF: "KC_CPNL", 0xC0: "KC_ASST", 0xC1: "KC_MCTL", 0xC2: "KC_LPAD"})
+        t.update({0xCD + i: n for i, n in enumerate(mouse)})
+        t.update({0xD6: "KC_MS_BTN6", 0xD7: "KC_MS_BTN7", 0xD8: "KC_MS_BTN8"})
+        t.update({0xD9 + i: n for i, n in enumerate(wheel)})
+    else:
+        t.update({0xF0 + i: n for i, n in enumerate(mouse)})
+        t.update({0xF9 + i: n for i, n in enumerate(wheel)})
+    return t
+
+
+_RGB = ["RGB_TOG", "RGB_MOD", "RGB_RMOD", "RGB_HUI", "RGB_HUD", "RGB_SAI", "RGB_SAD",
+        "RGB_VAI", "RGB_VAD", "RGB_SPI", "RGB_SPD", "RGB_M_P", "RGB_M_B", "RGB_M_R",
+        "RGB_M_SW", "RGB_M_SN", "RGB_M_K", "RGB_M_X", "RGB_M_G", "RGB_M_T", "RGB_M_TW"]
+_BACKLIGHT_V12 = ["BL_ON", "BL_OFF", "BL_TOGG", "BL_DOWN", "BL_UP", "BL_STEP", "BL_BRTG"]
+_BACKLIGHT_V10 = ["BL_ON", "BL_OFF", "BL_DOWN", "BL_UP", "BL_TOGG", "BL_STEP", "BL_BRTG"]
+NAMED_V12 = {0x7800 + i: n for i, n in enumerate(_BACKLIGHT_V12)}
+NAMED_V12.update({0x7820 + i: n for i, n in enumerate(_RGB)})
+NAMED_V12.update({0x7C00: "QK_BOOT", 0x7C01: "QK_REBOOT", 0x7C16: "QK_GESC"})
+NAMED_V10 = {0x5CBB + i: n for i, n in enumerate(_BACKLIGHT_V10)}
+NAMED_V10.update({0x5CC2 + i: n for i, n in enumerate(_RGB)})
+NAMED_V10.update({0x5C00: "QK_BOOT"})
+
+
+def _mods(bits: int) -> list[str]:
+    side = "R" if bits & 0x10 else "L"
+    return [side + n for b, n in ((1, "CTL"), (2, "SFT"), (4, "ALT"), (8, "GUI")) if bits & b]
+
+
+def keycode_decoder(protocol: int):
+    """VIA protocol 12+ (QMK 0.19 and later) uses QMK's current numbering;
+    older firmware uses the "v10" layout. Unknown values come back as hex."""
+    basic = _basic_names(protocol)
+    v12 = protocol >= 12
+
+    def kc(b: int) -> str:
+        return basic.get(b, f"0x{b:02x}")
+
+    def mask(bits: int) -> str:
+        return "|".join("MOD_" + m for m in _mods(bits)) or "0"
+
+    def decode(code: int) -> str:
+        if code in basic:
+            return basic[code]
+        if 0x0100 <= code <= 0x1FFF:  # modifiers + key, e.g. LCTL(LSFT(KC_K))
+            name = kc(code & 0xFF)
+            for mod in reversed(_mods(code >> 8 & 0x1F)):
+                name = f"{mod}({name})"
+            return name
+        if 0x4000 <= code <= 0x4FFF:
+            return f"LT({code >> 8 & 0xF},{kc(code & 0xFF)})"
+        if v12:
+            if 0x2000 <= code <= 0x3FFF:
+                return f"MT({mask(code >> 8 & 0x1F)},{kc(code & 0xFF)})"
+            if 0x5000 <= code <= 0x51FF:
+                return f"LM({code >> 5 & 0xF},{mask(code & 0x1F)})"
+            for start, op in ((0x5200, "TO"), (0x5220, "MO"), (0x5240, "DF"),
+                              (0x5260, "TG"), (0x5280, "OSL"), (0x52C0, "TT")):
+                if start <= code < start + 0x20:
+                    return f"{op}({code - start})"
+            if 0x52A0 <= code <= 0x52BF:
+                return f"OSM({mask(code & 0x1F)})"
+            if 0x7700 <= code <= 0x771F:
+                return f"MACRO({code - 0x7700})"
+            if 0x7E00 <= code <= 0x7E1F:
+                return f"CUSTOM({code - 0x7E00})"
+            return NAMED_V12.get(code, f"0x{code:04x}")
+        if 0x6000 <= code <= 0x7FFF:
+            return f"MT({mask(code >> 8 & 0x1F)},{kc(code & 0xFF)})"
+        if 0x5000 <= code <= 0x50FF:
+            return f"TO({code & 0xF})"
+        ops = {0x51: "MO", 0x52: "DF", 0x53: "TG", 0x54: "OSL", 0x58: "TT"}
+        if code >> 8 in ops:
+            return f"{ops[code >> 8]}({code & 0x1F})"
+        if 0x5500 <= code <= 0x55FF:
+            return f"OSM({mask(code & 0x1F)})"
+        if 0x5900 <= code <= 0x59FF:
+            return f"LM({code >> 4 & 0xF},{mask(code & 0xF)})"
+        if 0x5F12 <= code < 0x5F22:
+            return f"MACRO({code - 0x5F12})"
+        if 0x5F80 <= code < 0x5FA0:
+            return f"CUSTOM({code - 0x5F80})"
+        return NAMED_V10.get(code, f"0x{code:04x}")
+
+    return decode
+
+
+# ---------------------------------------------------------------------------
+# Labels: what to print on each keycap
+# ---------------------------------------------------------------------------
+# Variants run from most to least descriptive and "\n" breaks a line; the
+# renderers print the first one that fits the keycap at a readable size.
+
+@dataclass
+class Label:
+    variants: tuple[str, ...]
+    tip: str
+    kind: str
+    link: tuple[str, int] | None = None  # (op, layer) for layer keys like MO(4)
+
+
+SIMPLE: dict[str, tuple[tuple[str, ...], str, str]] = {
+    "KC_ESC": (("Esc",), "Escape", "base"),
+    "KC_TAB": (("Tab",), "Tab", "base"),
+    "KC_CAPS": (("Caps Lock", "Caps"), "Caps Lock", "base"),
+    "KC_BSPC": (("Backspace", "Bksp"), "Backspace", "base"),
+    "KC_DEL": (("Del",), "Delete", "base"),
+    "KC_ENT": (("Enter",), "Enter", "base"),
+    "KC_SPC": (("Space",), "Space", "base"),
+    "KC_LSFT": (("Shift",), "Left Shift", "base"),
+    "KC_RSFT": (("Shift",), "Right Shift", "base"),
+    "KC_LCTL": (("Ctrl",), "Left Ctrl", "base"),
+    "KC_RCTL": (("Ctrl",), "Right Ctrl", "base"),
+    "KC_LALT": (("Alt",), "Left Alt (Option on a Mac)", "base"),
+    "KC_RALT": (("Alt",), "Right Alt / AltGr", "base"),
+    "KC_LGUI": (("Meta",), "Left Meta, the Super / Windows / Command key", "base"),
+    "KC_RGUI": (("Meta",), "Right Meta, the Super / Windows / Command key", "base"),
+    "KC_APP": (("Menu",), "Context menu", "base"),
+    "KC_UP": (("↑",), "Arrow up", "base"),
+    "KC_DOWN": (("↓",), "Arrow down", "base"),
+    "KC_LEFT": (("←",), "Arrow left", "base"),
+    "KC_RGHT": (("→",), "Arrow right", "base"),
+    "KC_GRV": (("`",), "Backtick (with Shift: ~)", "base"),
+    "KC_MINS": (("-",), "Minus (with Shift: _)", "base"),
+    "KC_EQL": (("=",), "Equals (with Shift: +)", "base"),
+    "KC_LBRC": (("[",), "Left bracket (with Shift: {)", "base"),
+    "KC_RBRC": (("]",), "Right bracket (with Shift: })", "base"),
+    "KC_BSLS": (("\\",), "Backslash (with Shift: |)", "base"),
+    "KC_NUHS": (("#",), "Non-US #", "base"),
+    "KC_NUBS": (("\\",), "Non-US backslash", "base"),
+    "KC_SCLN": ((";",), "Semicolon (with Shift: :)", "base"),
+    "KC_QUOT": (("'",), "Quote (with Shift: \")", "base"),
+    "KC_COMM": ((",",), "Comma (with Shift: <)", "base"),
+    "KC_DOT": ((".",), "Period (with Shift: >)", "base"),
+    "KC_SLSH": (("/",), "Slash (with Shift: ?)", "base"),
+    "KC_PSCR": (("PrtSc",), "Print Screen", "system"),
+    "KC_SLCK": (("ScrLk",), "Scroll Lock", "base"),
+    "KC_PAUS": (("Pause",), "Pause / Break", "base"),
+    "KC_INS": (("Ins",), "Insert", "base"),
+    "KC_HOME": (("Home",), "Home", "base"),
+    "KC_END": (("End",), "End", "base"),
+    "KC_PGUP": (("PgUp",), "Page Up", "base"),
+    "KC_PGDN": (("PgDn",), "Page Down", "base"),
+    "KC_NLCK": (("Num\nLock", "NumLk"), "Num Lock", "base"),
+    "KC_MUTE": (("Mute",), "Mute audio", "media"),
+    "KC_VOLU": (("Vol +",), "Volume up", "media"),
+    "KC_VOLD": (("Vol −",), "Volume down", "media"),
+    "KC_MPLY": (("Play/\nPause", "Play"), "Play / pause", "media"),
+    "KC_MNXT": (("Next",), "Next track", "media"),
+    "KC_MPRV": (("Prev",), "Previous track", "media"),
+    "KC_MSTP": (("Stop",), "Stop playback", "media"),
+    "KC_MFFD": (("Fast\nFwd", "FFwd"), "Fast forward", "media"),
+    "KC_MRWD": (("Rewind", "Rew"), "Rewind", "media"),
+    "KC_EJCT": (("Eject",), "Eject", "media"),
+    "KC_BRIU": (("Screen\nBright +", "Bright +", "Bri +"), "Screen brightness up", "display"),
+    "KC_BRID": (("Screen\nBright −", "Bright −", "Bri −"), "Screen brightness down", "display"),
+    "KC_PWR": (("Power",), "Power key. What it does is set in System Settings > Power Management",
+               "system"),
+    "KC_POWER": (("Power",), "Power key", "system"),
+    "KC_SLEP": (("Sleep",), "Put the computer to sleep", "system"),
+    "KC_WAKE": (("Wake",), "Wake the computer", "system"),
+    "KC_CALC": (("Calc",), "Calculator", "system"),
+    "KC_MAIL": (("Mail",), "Mail", "system"),
+    "KC_MYCM": (("Files",), "File manager", "system"),
+    "KC_WSCH": (("Search",), "Web search", "system"),
+    "KC_WHOM": (("Home\npage", "WHome"), "Browser home", "system"),
+    "KC_WBAK": (("Back",), "Browser back", "system"),
+    "KC_WFWD": (("Forward", "Fwd"), "Browser forward", "system"),
+    "KC_WREF": (("Reload",), "Browser reload", "system"),
+    "KC_MCTL": (("Mission\nControl", "MCtl"), "macOS Mission Control", "system"),
+    "KC_LPAD": (("Launch-\npad", "LPad"), "macOS Launchpad", "system"),
+    "KC_MS_UP": (("Mouse\n↑", "Mouse ↑", "M ↑"), "Move the mouse pointer up", "mouse"),
+    "KC_MS_DOWN": (("Mouse\n↓", "Mouse ↓", "M ↓"), "Move the mouse pointer down", "mouse"),
+    "KC_MS_LEFT": (("Mouse\n←", "Mouse ←", "M ←"), "Move the mouse pointer left", "mouse"),
+    "KC_MS_RIGHT": (("Mouse\n→", "Mouse →", "M →"), "Move the mouse pointer right", "mouse"),
+    "KC_MS_BTN1": (("Left\nClick", "L Click", "Click"), "Left mouse button", "mouse"),
+    "KC_MS_BTN2": (("Right\nClick", "R Click"), "Right mouse button", "mouse"),
+    "KC_MS_BTN3": (("Middle\nClick", "M Click"), "Middle mouse button", "mouse"),
+    "KC_MS_BTN4": (("Mouse\nBack", "M Back"), "Mouse button 4 (back)", "mouse"),
+    "KC_MS_BTN5": (("Mouse\nFwd", "M Fwd"), "Mouse button 5 (forward)", "mouse"),
+    "KC_MS_WH_UP": (("Scroll\n↑", "Scroll ↑", "Wh ↑"), "Scroll wheel up", "mouse"),
+    "KC_MS_WH_DOWN": (("Scroll\n↓", "Scroll ↓", "Wh ↓"), "Scroll wheel down", "mouse"),
+    "KC_MS_WH_LEFT": (("Scroll\n←", "Scroll ←", "Wh ←"), "Scroll left", "mouse"),
+    "KC_MS_WH_RIGHT": (("Scroll\n→", "Scroll →", "Wh →"), "Scroll right", "mouse"),
+    "KC_MS_ACCEL0": (("Mouse\nSlow", "Accel 0"), "Mouse keys: slow", "mouse"),
+    "KC_MS_ACCEL1": (("Mouse\nMedium", "Accel 1"), "Mouse keys: medium speed", "mouse"),
+    "KC_MS_ACCEL2": (("Mouse\nFast", "Accel 2"), "Mouse keys: fast", "mouse"),
+    "RGB_TOG": (("Light\nOn/Off", "Light On/Off", "Light"), "Backlight on / off", "light"),
+    "RGB_MOD": (("Light\nMode +", "Mode +"), "Backlight: next effect", "light"),
+    "RGB_RMOD": (("Light\nMode −", "Mode −"), "Backlight: previous effect", "light"),
+    "RGB_HUI": (("Light\nHue +", "Hue +"), "Backlight: shift the hue forward", "light"),
+    "RGB_HUD": (("Light\nHue −", "Hue −"), "Backlight: shift the hue back", "light"),
+    "RGB_SAI": (("Light\nSat +", "Sat +"), "Backlight: more saturated", "light"),
+    "RGB_SAD": (("Light\nSat −", "Sat −"), "Backlight: less saturated", "light"),
+    "RGB_VAI": (("Light\nBright +", "Light +"), "Backlight brighter", "light"),
+    "RGB_VAD": (("Light\nBright −", "Light −"), "Backlight dimmer", "light"),
+    "RGB_SPI": (("Light\nSpeed +", "Speed +"), "Backlight effect faster", "light"),
+    "RGB_SPD": (("Light\nSpeed −", "Speed −"), "Backlight effect slower", "light"),
+    "BL_TOGG": (("Back-\nlight", "BL"), "Backlight on / off", "light"),
+    "QK_BOOT": (("Boot-\nloader", "Boot"), "Reboot into the bootloader to flash firmware", "system"),
+    "QK_REBOOT": (("Reboot",), "Restart the keyboard", "system"),
+    "QK_GESC": (("Esc\n`", "Esc `"), "Escape; with Shift or Meta it types `", "base"),
+}
+
+# NuPhy's custom keycodes, keyed by their title in the VIA definition
+NUPHY: dict[str, tuple[tuple[str, ...], str, str]] = {
+    "RF DFU": (("RF DFU",), "Wireless module firmware-update mode", "system"),
+    "Link USB": (("USB",), "Switch to wired USB mode", "connect"),
+    "Link RF": (("2.4G",), "Switch to the 2.4 GHz dongle", "connect"),
+    "Link BLE_1": (("BT 1",), "Bluetooth device 1 (tap to switch, hold to pair)", "connect"),
+    "Link BLE_2": (("BT 2",), "Bluetooth device 2 (tap to switch, hold to pair)", "connect"),
+    "Link BLE_3": (("BT 3",), "Bluetooth device 3 (tap to switch, hold to pair)", "connect"),
+    "Mac Task": (("Mission\nControl", "Task"), "macOS Mission Control", "system"),
+    "Mac Search": (("Spot-\nlight", "Search"), "macOS Spotlight search", "system"),
+    "Mac Siri Voice": (("Siri",), "macOS Siri / dictation", "system"),
+    "Mac Console": (("Console",), "macOS Console", "system"),
+    "Mac Dnd": (("Do Not\nDisturb", "DND"), "macOS Do Not Disturb", "system"),
+    "Print Whole": (("Screen-\nshot", "Shot"), "Screenshot of the whole screen", "system"),
+    "Print Area": (("Shot\nArea", "Area"), "Screenshot of a selected area", "system"),
+    "Side Light +": (("Side\nLight +", "Side Light +", "Side +"), "Side light brighter", "side"),
+    "Side Light -": (("Side\nLight −", "Side Light −", "Side −"), "Side light dimmer", "side"),
+    "Side Next Mode": (("Side\nMode", "Side Mode"), "Side light: next effect", "side"),
+    "Side Next Color": (("Side\nColor", "Side Color"), "Side light: next color", "side"),
+    "Side Speed +": (("Side\nSpeed +", "Side Spd +"), "Side light effect faster", "side"),
+    "Side Speed -": (("Side\nSpeed −", "Side Spd −"), "Side light effect slower", "side"),
+    "Device Reset": (("Device\nReset", "Device Reset", "Reset"),
+                     "NuPhy device reset, back to factory settings", "system"),
+    "Auto Sleep Mode": (("Sleep\nMode", "Sleep Mode", "Sleep"),
+                        "Change the keyboard's auto-sleep setting", "system"),
+    "Battery Show": (("Battery", "Batt"), "Show the battery level on the LEDs", "system"),
+    "Hold for 3 seconds for RGB color test": (("RGB\nTest", "RGB Test"),
+                                              "Hold 3 s for the RGB color test", "light"),
+    "SHIFT+` = ~": (("~",), "Types a tilde (Shift + `)", "base"),
+}
+
+ALIASES = {
+    "KC_TRANSPARENT": "KC_TRNS", "_______": "KC_TRNS", "XXXXXXX": "KC_NO",
+    "KC_ENTER": "KC_ENT", "KC_ESCAPE": "KC_ESC", "KC_BACKSPACE": "KC_BSPC",
+    "KC_SPACE": "KC_SPC", "KC_DELETE": "KC_DEL", "KC_RIGHT": "KC_RGHT", "KC_SCRL": "KC_SLCK",
+    "KC_NUM": "KC_NLCK", "KC_LCMD": "KC_LGUI", "KC_RCMD": "KC_RGUI", "KC_LWIN": "KC_LGUI",
+    "KC_RWIN": "KC_RGUI", "KC_LOPT": "KC_LALT", "KC_ROPT": "KC_RALT",
+    "KC_AUDIO_MUTE": "KC_MUTE", "KC_AUDIO_VOL_UP": "KC_VOLU", "KC_AUDIO_VOL_DOWN": "KC_VOLD",
+    "KC_MEDIA_PLAY_PAUSE": "KC_MPLY", "KC_MEDIA_NEXT_TRACK": "KC_MNXT",
+    "KC_MEDIA_PREV_TRACK": "KC_MPRV", "KC_BRIGHTNESS_UP": "KC_BRIU",
+    "KC_BRIGHTNESS_DOWN": "KC_BRID", "KC_SYSTEM_POWER": "KC_PWR",
+    "KC_MS_U": "KC_MS_UP", "KC_MS_D": "KC_MS_DOWN", "KC_MS_L": "KC_MS_LEFT",
+    "KC_MS_R": "KC_MS_RIGHT", "KC_BTN1": "KC_MS_BTN1", "KC_BTN2": "KC_MS_BTN2",
+    "KC_BTN3": "KC_MS_BTN3", "KC_WH_U": "KC_MS_WH_UP", "KC_WH_D": "KC_MS_WH_DOWN",
+    "KC_WH_L": "KC_MS_WH_LEFT", "KC_WH_R": "KC_MS_WH_RIGHT",
+    "RGB_MODE_FORWARD": "RGB_MOD", "RGB_MODE_REVERSE": "RGB_RMOD", "KC_GESC": "QK_GESC",
+    "RESET": "QK_BOOT",
+}
+
+MOD_WRAPPERS = {
+    "LCTL": ("Ctrl",), "RCTL": ("RCtrl",), "LSFT": ("Shift",), "RSFT": ("RShift",),
+    "LALT": ("Alt",), "LOPT": ("Alt",), "RALT": ("AltGr",), "ROPT": ("AltGr",),
+    "LGUI": ("Meta",), "LCMD": ("Meta",), "LWIN": ("Meta",),
+    "RGUI": ("RMeta",), "RCMD": ("RMeta",), "RWIN": ("RMeta",),
+    "C_S": ("Ctrl", "Shift"), "LCS": ("Ctrl", "Shift"), "MEH": ("Ctrl", "Shift", "Alt"),
+    "HYPR": ("Ctrl", "Shift", "Alt", "Meta"), "LCA": ("Ctrl", "Alt"), "LSA": ("Shift", "Alt"),
+    "LSG": ("Shift", "Meta"), "SGUI": ("Shift", "Meta"), "SCMD": ("Shift", "Meta"),
+    "SWIN": ("Shift", "Meta"), "LAG": ("Alt", "Meta"), "LCG": ("Ctrl", "Meta"),
+    "LCAG": ("Ctrl", "Alt", "Meta"), "LSAG": ("Shift", "Alt", "Meta"),
+    "RCS": ("RCtrl", "RShift"), "RSA": ("RShift", "AltGr"), "SAGR": ("RShift", "AltGr"),
+    "RSG": ("RShift", "RMeta"), "RAG": ("AltGr", "RMeta"),
+}
+MOD_MASKS = {f"MOD_{k}": v for k, v in MOD_WRAPPERS.items() if len(k) == 4}
+MOD_ORDER = ("Meta", "RMeta", "Ctrl", "RCtrl", "Alt", "AltGr", "Shift", "RShift")  # KDE's order
+LAYER_VERBS = {"MO": "Hold for", "TT": "Hold (or tap twice to lock) for", "LT": "Hold for",
+               "LM": "Hold for", "OSL": "Tap once for", "TG": "Toggle", "TO": "Switch to",
+               "DF": "Make default:"}
+TRANSPARENT = {"KC_TRNS", "KC_TRANSPARENT", "_______"}
+
+
+def flat(text: str) -> str:
+    return text.replace("-\n", "").replace("/\n", "/").replace("\n", " ")
+
+
+def _sort_mods(mods) -> list[str]:
+    return sorted(set(mods), key=MOD_ORDER.index)
+
+
+def describe(code: str, board: Board, macros=()) -> Label:
+    code = ALIASES.get(code, code)
+    if code in TRANSPARENT:
+        return Label(("▽",), "Transparent: uses the key from the layer below", "trns")
+    if code == "KC_NO":
+        return Label(("✕",), "Does nothing on this layer", "none")
+    if code in SIMPLE:
+        variants, tip, kind = SIMPLE[code]
+        return Label(variants, tip, kind)
+    if m := re.fullmatch(r"KC_([A-Z0-9])", code):
+        return Label((m[1],), m[1], "base")
+    if m := re.fullmatch(r"KC_F(\d+)", code):
+        return Label((f"F{m[1]}",), f"F{m[1]}", "fkey")
+    if m := re.fullmatch(r"(MO|TG|TO|TT|OSL|DF)\((\d+)\)", code):
+        return Label((f"L{m[2]}",), f"{LAYER_VERBS[m[1]]} layer {m[2]}", "layer", (m[1], int(m[2])))
+    if m := re.fullmatch(r"LT\(?(\d+)[,(]\s*(\w+)\)", code):  # LT(4,KC_A) or LT4(KC_A)
+        tap = flat(describe(m[2], board, macros).variants[-1])
+        return Label((f"{tap}\nhold L{m[1]}", f"{tap} / L{m[1]}"),
+                     f"Tap: {tap}. Hold: layer {m[1]}", "layer", ("LT", int(m[1])))
+    if m := re.fullmatch(r"LM\((\d+),\s*([\w|]+)\)", code):
+        return Label((f"L{m[1]}",), f"Hold for layer {m[1]} with modifiers", "layer", ("LM", int(m[1])))
+    if m := re.fullmatch(r"CUSTOM\((\d+)\)", code):
+        n = int(m[1])
+        entry = board.custom[n] if n < len(board.custom) else {}
+        title = entry.get("title", f"Custom {n}")
+        if title in NUPHY:
+            variants, tip, kind = NUPHY[title]
+            return Label(variants, tip, kind)
+        name = entry.get("name", f"Custom\n{n}")
+        return Label((name, flat(name)), title, "other")
+    if m := re.fullmatch(r"MACRO\((\d+)\)|M(\d+)", code):
+        n = int(m[1] or m[2])
+        text = macros[n] if n < len(macros) else ""
+        return Label((f"Macro\n{n}", f"Macro {n}", f"M{n}"),
+                     f"Macro {n}" + (f": {text}" if text else ""), "macro")
+    mods, inner = [], code
+    while (m := re.fullmatch(r"([A-Z_]+)\((.+)\)", inner)) and m[1] in MOD_WRAPPERS:
+        mods += MOD_WRAPPERS[m[1]]
+        inner = m[2]
+    if mods:
+        key = flat(describe(inner, board, macros).variants[-1])
+        combo = "+".join(_sort_mods(mods))
+        short = "".join(x[0] for x in _sort_mods(mods))
+        return Label((f"{combo}+\n{key}", f"{combo}+{key}", f"{short}+{key}"),
+                     f"Sends {combo}+{key}", "shortcut")
+    if m := re.fullmatch(r"([A-Z_]+?)_T\((\w+)\)", code):  # LCTL_T(KC_A)
+        hold = MOD_WRAPPERS.get(m[1])
+        if hold:
+            tap = flat(describe(m[2], board, macros).variants[-1])
+            held = "+".join(_sort_mods(hold))
+            return Label((f"{tap}\n{held}", f"{tap} / {held}"),
+                         f"Tap: {tap}. Hold: {held}", "shortcut")
+    if m := re.fullmatch(r"MT\(([\w|]+),\s*(\w+)\)", code):
+        hold = [x for part in m[1].split("|") for x in MOD_MASKS.get(part.strip(), ())]
+        tap = flat(describe(m[2], board, macros).variants[-1])
+        held = "+".join(_sort_mods(hold)) or "mod"
+        return Label((f"{tap}\n{held}", f"{tap} / {held}"), f"Tap: {tap}. Hold: {held}", "shortcut")
+    if code.lower().startswith("0x"):
+        return Label((code.lower(),), f"Keycode {code} (not in this viewer's tables)", "other")
+    return Label((re.sub(r"^(KC|QK)_", "", code),), code, "other")
+
+
+# ---------------------------------------------------------------------------
+# Layers: how they connect, and what each view shows
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LayerInfo:
+    index: int
+    stack: list[int]  # layers active while this one is on, topmost first
+    name: str  # "Fn + Shift"
+    role: str  # color slot: "base", "l1", "l2", ...
+    held: list[int]  # physical keys you hold to get here
+    summary: str = ""
+
+
+@dataclass
+class Mode:
+    name: str  # "Windows" / "Mac", from the switch on the keyboard's side
+    layers: list[LayerInfo]
+
+
+SUMMARIES = {"side": "side lights", "light": "backlight", "mouse": "mouse keys",
+             "fkey": "F-keys", "media": "media keys", "connect": "connections"}
+
+
+def effective(layers: list[list[str]], stack: list[int], idx: int) -> str:
+    for li in stack:
+        if layers[li][idx] not in TRANSPARENT:
+            return layers[li][idx]
+    return "KC_NO"
+
+
+def mode_name(board: Board, layer: list[str]) -> str | None:
+    """NuPhy keeps a Mac and a Windows base layer; the bottom row tells them apart."""
+    bottom = max(k.y for k in board.keys)
+    x = {ALIASES.get(layer[k.idx], layer[k.idx]): k.x for k in reversed(board.keys) if k.y == bottom}
+    if "KC_LGUI" in x and "KC_LALT" in x:
+        return "Windows" if x["KC_LGUI"] < x["KC_LALT"] else "Mac"
+    return None
+
+
+def summarize(board: Board, layer: list[str]) -> str:
+    kinds = Counter(describe(layer[k.idx], board).kind for k in board.keys
+                    if layer[k.idx] not in TRANSPARENT)
+    kinds.pop("layer", None)
+    if not kinds:
+        return ""
+    kind, n = kinds.most_common(1)[0]
+    return SUMMARIES.get(kind, "") if n >= 3 and n / sum(kinds.values()) >= 0.6 else ""
+
+
+def find_modes(board: Board, layers: list[list[str]]) -> list[Mode]:
+    """Base layers are the non-empty ones no other layer points to. From each,
+    follow the layer keys (MO, TT, ...) to name the layers by how you reach them."""
+    def link(code: str):
+        return describe(code, board).link
+
+    reached = {ln[1] for li, layer in enumerate(layers) for k in board.keys
+               if (ln := link(layer[k.idx])) and ln[1] != li}
+    modes = []
+    for b, base in enumerate(layers):
+        if b in reached or all(c in TRANSPARENT or c == "KC_NO" for c in (base[k.idx] for k in board.keys)):
+            continue
+        root = LayerInfo(b, [b], "Base", "base", [])
+        infos, seen, queue = [root], {b}, [root]
+        while queue:
+            cur = queue.pop(0)
+            targets: dict[int, list[int]] = {}
+            for k in board.keys:
+                ln = link(effective(layers, cur.stack, k.idx))
+                if ln and ln[1] not in seen and ln[1] < len(layers):
+                    targets.setdefault(ln[1], []).append(k.idx)
+            for t, idxs in targets.items():
+                seen.add(t)
+                if cur is root:
+                    n = sum(1 for i in infos if i.stack[1:] == [b])
+                    name = "Fn" if n == 0 else f"Fn {n + 1}"
+                else:
+                    pressed = flat(describe(base[idxs[0]], board).variants[-1])
+                    name = f"{cur.name} + {pressed}"
+                info = LayerInfo(t, [t, *cur.stack], name, f"l{min(len(infos), 6)}", [*cur.held, *idxs])
+                infos.append(info)
+                queue.append(info)
+        for info in infos[1:]:
+            info.summary = summarize(board, layers[info.index])
+        modes.append(Mode(mode_name(board, base) or f"Layer {b}", infos))
+    return modes
+
+
+def link_legend(label: Label, mode: Mode, in_base: bool) -> tuple[Label, str]:
+    """Relabel a layer key with the layer's name, colored like the layer it opens."""
+    op, n = label.link
+    info = next((i for i in mode.layers if i.index == n), None)
+    if info is None:
+        return Label((f"Layer {n}", f"L{n}"), label.tip, "layer", label.link), "muted"
+    tip = f"{LAYER_VERBS.get(op, 'Hold for')} the {info.name} layer"
+    if info.summary:
+        tip += f" ({info.summary})"
+    if in_base:
+        return Label((info.name,), tip, "layer", label.link), "base"
+    target = info.summary.capitalize() if info.summary else info.name
+    compact = target.replace(" + ", "+")
+    variants = [f"▸ {target}", f"▸ {compact}"]
+    if info.summary and " " in target:
+        first, rest = target.split(" ", 1)
+        variants += [f"▸ {first}\n{rest}", f"▸ {first}"]
+    elif not info.summary:
+        variants.append(f"{compact}\nlayer")
+    return Label(tuple(dict.fromkeys(variants)), tip, "layer", label.link), info.role
+
+
+def tip_entry(layer: str, role: str, label: Label, code: str, note: str = "") -> dict:
+    return {"layer": layer, "role": role, "text": flat(label.variants[0]),
+            "desc": label.tip, "code": code, "note": note}
+
+
+def build_views(board: Board, km: Keymap, mode: Mode) -> list[dict]:
+    layers, base = km.layers, mode.layers[0]
+
+    def label_of(code: str, from_base: bool) -> tuple[Label, str | None]:
+        lab = describe(code, board, km.macros)
+        if lab.link:
+            return link_legend(lab, mode, from_base)
+        return lab, None
+
+    def geometry(k: PhysKey) -> dict:
+        return {"i": k.idx, "x": k.x, "y": k.y, "w": k.w, "h": k.h}
+
+    # Overview: one keyboard, every layer's legend on the keycap, like printed side legends
+    keys = []
+    for k in board.keys:
+        bcode = layers[base.index][k.idx]
+        blab, _ = label_of(bcode, True)
+        legends = [{"v": blab.variants, "role": "base", "slot": "corner"}]
+        tip = [tip_entry("Base", "base", blab, bcode)]
+        for info in mode.layers[1:]:
+            code = layers[info.index][k.idx]
+            if code in TRANSPARENT or code == effective(layers, info.stack[1:], k.idx):
+                continue
+            lab, link_role = label_of(code, False)
+            legends.append({"v": lab.variants, "role": link_role or info.role, "slot": "sub"})
+            tip.append(tip_entry(info.name, info.role, lab, code))
+        keys.append({**geometry(k), "legends": legends, "tint": None, "dim": False,
+                     "held": None, "tip": tip})
+    chips = [["base", "Base layer"]] + [[i.role, f"Hold {i.name}"] for i in mode.layers[1:]]
+    views = [{"id": "overview", "title": "Overview", "role": "accent", "summary": "",
+              "chips": chips, "keys": keys}]
+
+    # One view per layer: what each key does while that layer is on
+    for info in mode.layers:
+        is_base = info is base
+        parent = next((i for i in mode.layers if i.index == info.stack[1]), base) if len(info.stack) > 1 else base
+        keys = []
+        for k in board.keys:
+            code = layers[info.index][k.idx]
+            eff = effective(layers, info.stack, k.idx)
+            source = next((li for li in info.stack if layers[li][k.idx] not in TRANSPARENT), info.index)
+            lab, _ = label_of(eff, source == base.index)
+            blab, _ = label_of(layers[base.index][k.idx], True)
+            defined = is_base or code not in TRANSPARENT
+            held = k.idx in info.held
+            if held:
+                legends = [{"v": blab.variants, "role": info.role, "slot": "main"}]
+            elif is_base:
+                legends = [{"v": lab.variants, "role": "base", "slot": "main"}]
+            elif defined:
+                legends = [{"v": blab.variants, "role": "base", "slot": "corner"},
+                           {"v": lab.variants, "role": "ink", "slot": "main"}]
+            else:
+                legends = [{"v": lab.variants, "role": "dim", "slot": "main"}]
+            from_name = next((i.name for i in mode.layers if i.index == source), f"layer {source}")
+            note = "" if defined or held else f"falls through from {from_name}"
+            if held:
+                note = "hold this to get here"
+            tip = [tip_entry(info.name, info.role, lab, eff, note)]
+            if not is_base:
+                tip.append(tip_entry("Base", "base", blab, layers[base.index][k.idx]))
+            keys.append({**geometry(k), "legends": legends,
+                         "tint": info.role if defined and not is_base and not held else None,
+                         "dim": not defined and not held,
+                         "held": info.role if held else None, "tip": tip})
+        if is_base:
+            chips = [["base", f"{mode.name} base layer: what the keys type with nothing held"]]
+        else:
+            chips = [[info.role, f"Changed on {info.name}"],
+                     ["dim", f"Same as {parent.name}"],
+                     [info.role, "Outlined: hold these"]]
+        views.append({"id": f"layer{info.index}", "title": info.name, "role": info.role,
+                      "summary": info.summary, "chips": chips, "keys": keys})
+    return views
+
+
+def friendly_time(t: dt.datetime) -> str:
+    today = dt.date.today()
+    if t.date() == today:
+        return f"today at {t:%H:%M}"
+    if t.date() == today - dt.timedelta(days=1):
+        return f"yesterday at {t:%H:%M}"
+    if t.year == today.year:
+        return f"on {t:%b} {t.day}"
+    return f"on {t:%b} {t.day}, {t.year}"
+
+
+def build_model(board: Board, km: Keymap, conns: list[str]) -> dict:
+    link = " + ".join(conns) if conns else "Not connected"
+    when = f"{km.when:%b} {km.when.day}, {km.when.year} at {km.when:%H:%M}"
+    if km.source == "usb":
+        headline = "Live from the keyboard over USB"
+        asof = f"Read from the keyboard on {when}"
+    elif km.source == "snapshot":
+        headline = f"{link} · last read from the keyboard {friendly_time(km.when)}"
+        asof = f"Last read from the keyboard on {when}"
+    else:
+        headline = f"{link} · from the VIA export {friendly_time(km.when)}"
+        asof = f"From a VIA export dated {when}"
+    if km.source != "usb" and "USB" not in conns:
+        headline += " · plug in USB to refresh"
+    return {
+        "board": {"name": board.name, "w": board.width, "h": board.height},
+        "source": {"kind": km.source, "headline": headline, "asof": asof, "note": km.note},
+        "generated": dt.datetime.now().isoformat(timespec="seconds"),
+        "modes": [{"name": m.name, "views": build_views(board, km, m)}
+                  for m in find_modes(board, km.layers)],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(**values):
+    state = load_state() | values
+    try:
+        STATE_FILE.write_text(json.dumps(state) + "\n")
+    except OSError:
+        pass
+
+
+def notify(title: str, body: str):
+    try:
+        subprocess.run(["notify-send", "-a", "NuPhy Keymap", "-i", "input-keyboard", title, body],
+                       check=False, stderr=subprocess.DEVNULL)
+    except OSError:
+        print(f"{title}: {body}", file=sys.stderr)
+
+
+def kde_accent() -> str:
+    """The desktop's accent color, lifted so it reads on the dark overlay."""
+    try:
+        text = (Path.home() / ".config" / "kdeglobals").read_text()
+        if m := re.search(r"^AccentColor=(\d+),(\d+),(\d+)", text, re.M):
+            h, l, s = colorsys.rgb_to_hls(*(int(v) / 255 for v in m.groups()))
+            r, g, b = colorsys.hls_to_rgb(h, max(l, 0.64), max(s, 0.42))
+            return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+    except OSError:
+        pass
+    return "#cdb575"
+
+
+def claim_overlay() -> bool:
+    """Toggle: if an overlay is already open, close it and return False."""
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(RUNTIME_DIR / "nuphy-keymap.pid", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            os.kill(int(os.pread(fd, 16, 0).decode()), signal.SIGTERM)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+        os.close(fd)
+        return False
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, str(os.getpid()).encode(), 0)
+    globals()["_overlay_lock_fd"] = fd  # the lock lives as long as this process
+    return True
+
+
+# ---------------------------------------------------------------------------
+# The overlay (PyQt6): a dimmed full-screen layer with the keyboard card
+# ---------------------------------------------------------------------------
+
+DARK = {"ink": "#f1efea", "base": "#e9e6df", "muted": "#9b9ea6", "dim": "#70737c",
+        "l1": "#6cb5ff", "l2": "#ffad5c", "l3": "#6bdc96", "l4": "#c79dff",
+        "l5": "#ff8fa3", "l6": "#5fd6d6"}
+
+
+def run_overlay(model: dict, screenshot: Path | None = None):
+    from PyQt6.QtCore import QEasingCurve, QEvent, QPointF, QRectF, Qt, QTimer, QVariantAnimation
+    from PyQt6.QtGui import (QColor, QFont, QFontMetricsF, QLinearGradient, QPainter,
+                             QPainterPath, QPen)
+    from PyQt6.QtWidgets import QApplication, QToolTip, QWidget
+
+    palette = DARK | {"accent": kde_accent()}
+    UI, CAP = "Fira Sans", "Fira Sans Condensed"
+    W = QFont.Weight
+    modes = model["modes"]
+    names = [m["name"] for m in modes]
+    wanted = load_state().get("mode")
+    start_mode = names.index(wanted) if wanted in names else names.index("Windows") if "Windows" in names else 0
+
+    def font(family: str, px: float, weight=W.Normal) -> QFont:
+        f = QFont(family)
+        f.setPixelSize(max(1, round(px)))
+        f.setWeight(weight)
+        return f
+
+    def color(role: str, alpha: float = 1.0) -> QColor:
+        c = QColor(palette.get(role, role))
+        c.setAlphaF(alpha)
+        return c
+
+    def mix(a: QColor, b: QColor, t: float) -> QColor:
+        return QColor.fromRgbF(a.redF() + (b.redF() - a.redF()) * t,
+                               a.greenF() + (b.greenF() - a.greenF()) * t,
+                               a.blueF() + (b.blueF() - a.blueF()) * t, 1.0)
+
+    def tooltip_html(kv: dict) -> str:
+        rows = []
+        for t in kv["tip"]:
+            note = f" <i>({html.escape(t['note'])})</i>" if t["note"] else ""
+            rows.append(
+                f"<tr><td style='color:{palette.get(t['role'], palette['ink'])};padding-right:10px'>"
+                f"<b>{html.escape(t['layer'])}</b></td><td><b>{html.escape(t['text'])}</b> · "
+                f"{html.escape(t['desc'])}{note}<br><span style='color:#8d9099'>"
+                f"{html.escape(t['code'])}</span></td></tr>")
+        return "<table cellspacing=3>" + "".join(rows) + "</table>"
+
+    class Overlay(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.mode_i, self.view_i = start_mode, 0
+            self.fade, self.hover, self.was_active = 0.0, None, False
+            self.backdrop = True  # off when rendering screenshots
+            self.hits: list[tuple[QRectF, str, object]] = []
+            self.card = QRectF()
+            self.fit_cache: dict = {}
+            self.setWindowTitle("NuPhy Keymap")
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setMouseTracking(True)
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            self.anim = QVariantAnimation(self)
+            self.anim.setStartValue(0.0)
+            self.anim.setEndValue(1.0)
+            self.anim.setDuration(150)
+            self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self.anim.valueChanged.connect(self._fade_to)
+
+        def _fade_to(self, value):
+            self.fade = float(value)
+            self.update()
+
+        @property
+        def views(self) -> list[dict]:
+            return modes[self.mode_i]["views"]
+
+        @property
+        def view(self) -> dict:
+            return self.views[min(self.view_i, len(self.views) - 1)]
+
+        # -- geometry -------------------------------------------------------
+        def layout(self):
+            bw, bh = model["board"]["w"], model["board"]["h"]
+            u = max(40.0, min(76.0, (self.width() - 160) / (bw + 1.0), (self.height() - 300) / bh))
+            pad, head, foot = 0.5 * u, 100.0, 62.0
+            cw, ch = bw * u + 2 * pad, head + bh * u + foot
+            card = QRectF((self.width() - cw) / 2, (self.height() - ch) / 2, cw, ch)
+            return u, pad, head, card, QPointF(card.left() + pad, card.top() + head)
+
+        # -- painting -------------------------------------------------------
+        def paintEvent(self, _event):
+            p = QPainter(self)
+            p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+            p.setOpacity(self.fade)
+            if self.backdrop:
+                p.fillRect(self.rect(), QColor(7, 8, 11, 170))
+            u, pad, head, card, origin = self.layout()
+            self.card, self.hits = card, []
+
+            for i in range(1, 13):  # soft shadow under the card
+                shadow = QPainterPath()
+                shadow.addRoundedRect(card.adjusted(-i * 2, -i * 2 + 10, i * 2, i * 2 + 10), 22 + i * 2, 22 + i * 2)
+                p.fillPath(shadow, QColor(0, 0, 0, max(0, 24 - 2 * i)))
+            body = QPainterPath()
+            body.addRoundedRect(card, 22, 22)
+            g = QLinearGradient(card.topLeft(), card.bottomLeft())
+            g.setColorAt(0, QColor("#25272d"))
+            g.setColorAt(1, QColor("#1b1c21"))
+            p.fillPath(body, g)
+            p.setPen(QPen(QColor(255, 255, 255, 24), 1))
+            p.drawPath(body)
+
+            self.paint_header(p, card, pad)
+            for kv in self.view["keys"]:
+                r = QRectF(origin.x() + kv["x"] * u, origin.y() + kv["y"] * u,
+                           kv["w"] * u, kv["h"] * u).adjusted(2.5, 2.5, -2.5, -2.5)
+                self.paint_key(p, kv, r, u)
+                self.hits.append((r, "key", kv))
+            self.paint_footer(p, card, pad, origin.y() + model["board"]["h"] * u)
+
+        def paint_header(self, p, card, pad):
+            x, y = card.left() + pad, card.top() + 26
+            p.setFont(font(CAP, 27, W.DemiBold))
+            fm = QFontMetricsF(p.font())
+            p.setPen(color("ink"))
+            p.drawText(QPointF(x, y + fm.ascent()), model["board"]["name"])
+            # Windows | Mac switch
+            p.setFont(font(UI, 13, W.Medium))
+            fs = QFontMetricsF(p.font())
+            sx, sy, sh = x + fm.horizontalAdvance(model["board"]["name"]) + 18, y + (fm.height() - 28) / 2, 28.0
+            frame = QRectF(sx, sy, sum(fs.horizontalAdvance(n) + 26 for n in names) + 6, sh)
+            outline = QPainterPath()
+            outline.addRoundedRect(frame, sh / 2, sh / 2)
+            p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+            p.drawPath(outline)
+            sx += 3
+            for i, name in enumerate(names):
+                r = QRectF(sx, sy + 3, fs.horizontalAdvance(name) + 26, sh - 6)
+                if i == self.mode_i:
+                    pill = QPainterPath()
+                    pill.addRoundedRect(r, r.height() / 2, r.height() / 2)
+                    p.fillPath(pill, color("ink", 0.92))
+                    p.setPen(QColor("#1d1e23"))
+                else:
+                    p.setPen(color("muted"))
+                p.drawText(r, Qt.AlignmentFlag.AlignCenter, name)
+                self.hits.append((r, "mode", i))
+                sx += r.width()
+            # where the keymap came from
+            src = model["source"]
+            line = src["headline"] + (f" · {src['note']}" if src["note"] else "")
+            p.setFont(font(UI, 13.5))
+            p.setPen(color("muted"))
+            p.drawText(QPointF(x, y + fm.height() + 6 + QFontMetricsF(p.font()).ascent()), line)
+            # layer tabs, right-aligned
+            p.setFont(font(UI, 13.5, W.Medium))
+            ft = QFontMetricsF(p.font())
+            widths = [ft.horizontalAdvance(v["title"]) + 28 for v in self.views]
+            tx = card.right() - pad - sum(widths) - 6 * (len(widths) - 1)
+            for i, (v, tw) in enumerate(zip(self.views, widths)):
+                r = QRectF(tx, y + 1, tw, 32)
+                pill = QPainterPath()
+                pill.addRoundedRect(r, 16, 16)
+                if i == self.view_i:
+                    p.fillPath(pill, color(v["role"], 0.18))
+                    p.setPen(QPen(color(v["role"], 0.85), 1.2))
+                    p.drawPath(pill)
+                    p.setPen(color(v["role"]))
+                else:
+                    p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+                    p.drawPath(pill)
+                    p.setPen(color("muted"))
+                p.drawText(r, Qt.AlignmentFlag.AlignCenter, v["title"])
+                self.hits.append((r, "view", i))
+                tx += tw + 6
+
+        def paint_footer(self, p, card, pad, top):
+            y = top + 22
+            p.setFont(font(UI, 13))
+            fm = QFontMetricsF(p.font())
+            x = card.left() + pad
+            for role, text in self.view["chips"]:
+                dot = QRectF(x, y + (fm.height() - 11) / 2, 11, 11)
+                path = QPainterPath()
+                path.addRoundedRect(dot, 3, 3)
+                if text.startswith("Outlined"):
+                    p.setPen(QPen(color(role), 1.6))
+                    p.drawPath(path)
+                elif role == "dim":
+                    p.fillPath(path, QColor("#3a3c43"))
+                else:
+                    p.fillPath(path, color(role))
+                p.setPen(color("muted"))
+                p.drawText(QPointF(x + 18, y + fm.ascent()), text)
+                x += 18 + fm.horizontalAdvance(text) + 26
+            if self.view["summary"]:
+                p.setPen(color(self.view["role"]))
+                p.drawText(QPointF(x, y + fm.ascent()), f"{self.view['title']}: {self.view['summary']}")
+            hint = "Tab / ← → switch views   ·   M  Windows/Mac   ·   Esc  close"
+            p.setPen(color("dim"))
+            p.drawText(QPointF(card.right() - pad - fm.horizontalAdvance(hint), y + fm.ascent()), hint)
+
+        def paint_key(self, p, kv, r, u):
+            radius = u * 0.13
+            skirt, top, bottom = QColor("#121317"), QColor("#3b3e46"), QColor("#30333a")
+            if kv["tint"]:
+                c = color(kv["tint"])
+                skirt, top, bottom = mix(skirt, c, 0.2), mix(top, c, 0.36), mix(bottom, c, 0.28)
+            if kv["dim"]:
+                base = QColor("#202227")
+                top, bottom = mix(top, base, 0.55), mix(bottom, base, 0.55)
+            outer = QPainterPath()
+            outer.addRoundedRect(r, radius, radius)
+            p.fillPath(outer, skirt)
+            face = r.adjusted(u * 0.055, u * 0.035, -u * 0.055, -u * 0.105)
+            g = QLinearGradient(face.topLeft(), face.bottomLeft())
+            g.setColorAt(0, top)
+            g.setColorAt(1, bottom)
+            inner = QPainterPath()
+            inner.addRoundedRect(face, radius * 0.75, radius * 0.75)
+            p.fillPath(inner, g)
+            if kv["held"]:
+                p.setPen(QPen(color(kv["held"]), 2.2))
+                p.drawPath(outer)
+            elif self.hover == kv["i"]:
+                p.setPen(QPen(QColor(255, 255, 255, 80), 1.3))
+                p.drawPath(outer)
+            self.paint_legends(p, kv, face, u)
+
+        def paint_legends(self, p, kv, face, u):
+            box = face.adjusted(u * 0.08, u * 0.05, -u * 0.08, -u * 0.06)
+            overview = self.view["id"] == "overview"
+            slots = {"corner": [], "main": [], "sub": []}
+            for lg in kv["legends"]:
+                slots[lg["slot"]].append(lg)
+            if slots["corner"]:
+                lg = slots["corner"][0]
+                px = u * (0.2 if overview else 0.142)
+                h = px * 1.35
+                lines, f = self.fit(lg["v"], box.width(), h, px, px * 0.72, 1, W.DemiBold if overview else W.Medium, 0.9)
+                p.setFont(f)
+                p.setPen(color(lg["role"], 0.95 if overview else 0.55))
+                p.drawText(QRectF(box.left(), box.top(), box.width(), h),
+                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, lines[0])
+            if slots["main"]:
+                lg = slots["main"][0]
+                top = box.top() + (u * 0.17 if slots["corner"] else 0)
+                area = QRectF(box.left(), top, box.width(), box.bottom() - top)
+                weight = W.DemiBold if kv["tint"] or kv["held"] else W.Medium
+                lines, f = self.fit(lg["v"], area.width(), area.height(), u * 0.205, u * 0.13, 2, weight)
+                p.setFont(f)
+                p.setPen(color(lg["role"]))
+                lh = QFontMetricsF(f).height()
+                y = area.top() + (area.height() - lh * len(lines)) / 2
+                for line in lines:
+                    p.drawText(QRectF(area.left(), y, area.width(), lh), Qt.AlignmentFlag.AlignCenter, line)
+                    y += lh
+            if slots["sub"]:
+                px = u * 0.158
+                lh = px * 1.25
+                y = box.bottom()
+                for lg in reversed(slots["sub"][:2]):
+                    lines, f = self.fit(lg["v"], box.width(), lh, px, u * 0.118, 1, W.DemiBold, 0.9)
+                    p.setFont(f)
+                    p.setPen(color(lg["role"]))
+                    p.drawText(QRectF(box.left(), y - lh, box.width(), lh),
+                               Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, lines[0])
+                    y -= lh
+
+        def fit(self, variants, width, height, px, min_px, max_lines, weight, comfort=0.75):
+            """The most descriptive variant that fits at a comfortable size; failing
+            that, any variant down to min_px; failing that, the shortest, elided."""
+            key = (tuple(variants), round(width), round(height), round(px), round(min_px), max_lines, weight, comfort)
+            if key in self.fit_cache:
+                return self.fit_cache[key]
+
+            def fits(v, size):
+                lines = v.split("\n")
+                if len(lines) > max_lines:
+                    return None
+                f = font(CAP, size, weight)
+                fm = QFontMetricsF(f)
+                if fm.height() * len(lines) <= height + 1 and max(fm.horizontalAdvance(s) for s in lines) <= width:
+                    return lines, f
+                return None
+
+            result = None
+            comfortable = round(max(min_px, px * comfort))
+            for low, high in ((comfortable, round(px)), (round(min_px), comfortable - 1)):
+                for v in variants:
+                    size = high
+                    while size >= low and not (result := fits(v, size)):
+                        size -= 1
+                    if result:
+                        break
+                if result:
+                    break
+            if result is None:
+                f = font(CAP, min_px, weight)
+                text = QFontMetricsF(f).elidedText(flat(variants[-1]), Qt.TextElideMode.ElideRight, width)
+                result = ([text], f)
+            self.fit_cache[key] = result
+            return result
+
+        # -- interaction ----------------------------------------------------
+        def hit(self, pos):
+            return next((h for h in self.hits if h[0].contains(pos)), None)
+
+        def mouseMoveEvent(self, e):
+            h = self.hit(e.position())
+            hover = h[2]["i"] if h and h[1] == "key" else None
+            if h and h[1] == "key":
+                QToolTip.showText(e.globalPosition().toPoint(), tooltip_html(h[2]), self)
+            else:
+                QToolTip.hideText()
+            self.setCursor(Qt.CursorShape.PointingHandCursor if h and h[1] in ("view", "mode")
+                           else Qt.CursorShape.ArrowCursor)
+            if hover != self.hover:
+                self.hover = hover
+                self.update()
+
+        def mousePressEvent(self, e):
+            h = self.hit(e.position())
+            if h and h[1] == "view":
+                self.view_i = h[2]
+                self.update()
+            elif h and h[1] == "mode":
+                self.set_mode(h[2])
+            elif not self.card.contains(e.position()):
+                self.close()
+
+        def set_mode(self, i: int):
+            self.mode_i = i % len(modes)
+            self.view_i = min(self.view_i, len(self.views) - 1)
+            save_state(mode=names[self.mode_i])
+            self.update()
+
+        def focusNextPrevChild(self, _next):  # let Tab reach keyPressEvent
+            return False
+
+        def keyPressEvent(self, e):
+            k, K = e.key(), Qt.Key
+            if k in (K.Key_Escape, K.Key_Q, K.Key_Space, K.Key_Return, K.Key_Enter, K.Key_F19):
+                self.close()
+            elif k in (K.Key_Tab, K.Key_Right, K.Key_L, K.Key_PageDown):
+                self.view_i = (self.view_i + 1) % len(self.views)
+                self.update()
+            elif k in (K.Key_Backtab, K.Key_Left, K.Key_H, K.Key_PageUp):
+                self.view_i = (self.view_i - 1) % len(self.views)
+                self.update()
+            elif K.Key_1 <= k <= K.Key_9 and k - K.Key_1 < len(self.views):
+                self.view_i = k - K.Key_1
+                self.update()
+            elif k in (K.Key_M, K.Key_W):
+                self.set_mode(self.mode_i + 1)
+
+        def showEvent(self, e):
+            super().showEvent(e)
+            self.anim.start()
+            self.activateWindow()
+
+        def changeEvent(self, e):
+            if e.type() == QEvent.Type.ActivationChange:  # click elsewhere closes it
+                if self.isActiveWindow():
+                    self.was_active = True
+                elif self.was_active:
+                    QTimer.singleShot(150, lambda: self.isActiveWindow() or self.close())
+            super().changeEvent(e)
+
+    app = QApplication([sys.argv[0]])
+    app.setApplicationName("nuphy-keymap")
+    app.setDesktopFileName("nuphy-keymap")
+    overlay = Overlay()
+    if screenshot:  # render offscreen: one image per mode and view, cropped to the card
+        overlay.resize(1920, 1080)
+        overlay.fade, overlay.backdrop = 1.0, False
+        for m in range(len(modes)):
+            overlay.mode_i = m
+            for v in range(len(overlay.views)):
+                overlay.view_i = v
+                image = overlay.grab()
+                image = image.copy(overlay.card.adjusted(-28, -20, 28, 36).toAlignedRect())
+                image.save(str(screenshot.with_name(f"{screenshot.stem}-{names[m]}-{v}{screenshot.suffix}")))
+        return
+    overlay.showFullScreen()
+    app.exec()
+
+
+# ---------------------------------------------------------------------------
+# HTML page (also publishable as a Claude artifact with --fragment)
+# ---------------------------------------------------------------------------
+
+HTML_HEAD = r"""<title>Air60 V2 Keymap</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Mono:wght@400;500&family=Fira+Sans+Condensed:wght@400;500;600;700&family=Fira+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: a keycap reference card. Name and Windows/Mac switch on top, layer
+   tabs, the board scaled to the column (it scrolls sideways on a phone), a
+   legend strip, then a detail card for whichever key is selected. */
+:root {
+  --paper: #ecebe6;
+  --case: #d8d6cf;
+  --cap: #fbfaf7;
+  --cap-low: #e9e7e0;
+  --skirt: #c2bfb6;
+  --ink: #22211d;
+  --muted: #67645c;
+  --line: #c9c6be;
+  --accent: #7a6532;
+  --l1: #1c69cc; --l2: #b55804; --l3: #137a44; --l4: #7446c2; --l5: #bd3657; --l6: #0e7a80;
+  --font-ui: "Fira Sans", "Noto Sans", system-ui, sans-serif;
+  --font-cap: "Fira Sans Condensed", "Fira Sans", "Noto Sans", sans-serif;
+  --font-code: "Fira Mono", "Hack", ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #131418; --case: #1d1f24; --cap: #3b3e46; --cap-low: #30333a; --skirt: #111216;
+    --ink: #efede8; --muted: #9a9da5; --line: #30323a; --accent: #cfb878;
+    --l1: #6cb5ff; --l2: #ffad5c; --l3: #6bdc96; --l4: #c79dff; --l5: #ff8fa3; --l6: #5fd6d6;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #131418; --case: #1d1f24; --cap: #3b3e46; --cap-low: #30333a; --skirt: #111216;
+  --ink: #efede8; --muted: #9a9da5; --line: #30323a; --accent: #cfb878;
+  --l1: #6cb5ff; --l2: #ffad5c; --l3: #6bdc96; --l4: #c79dff; --l5: #ff8fa3; --l6: #5fd6d6;
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; padding-inline: 16px; background: var(--paper); color: var(--ink); font: 400 15px/1.5 var(--font-ui); }
+.sheet { max-width: 1180px; margin-inline: auto; padding-block: 28px 44px; display: grid; gap: 16px; }
+.top { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 14px 28px; }
+.ident { min-width: 0; }
+h1 { margin: 0; font: 700 clamp(1.7rem, 1.2rem + 1.6vw, 2.5rem)/1.05 var(--font-cap); text-wrap: balance; }
+.asof { margin: 6px 0 0; color: var(--muted); }
+.seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 999px; }
+.seg button, .tab { font: 500 0.92rem/1.2 var(--font-ui); color: var(--muted); background: none; border: 1px solid transparent; border-radius: 999px; padding: 7px 15px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+.tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+.tab { border-color: var(--line); }
+.tab[aria-selected="true"] { color: var(--c); border-color: var(--c); background: color-mix(in srgb, var(--c) 13%, transparent); }
+.tab .sum { margin-left: 7px; font-weight: 400; color: var(--muted); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.board-scroll { overflow-x: auto; border-radius: 20px; }
+.board { min-width: 720px; padding: 1.2%; background: var(--case); border-radius: 20px; }
+.keys { position: relative; container-type: inline-size; aspect-ratio: var(--bw) / var(--bh); }
+.key { position: absolute; left: calc(var(--x) / var(--bw) * 100%); top: calc(var(--y) / var(--bh) * 100%); width: calc(var(--w) / var(--bw) * 100%); height: calc(var(--h) / var(--bh) * 100%); margin: 0; padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.cap { position: absolute; inset: 0.2cqw; border-radius: 0.85cqw; background: var(--skirt); }
+.face { position: absolute; inset: 0.28cqw 0.34cqw 0.72cqw; border-radius: 0.62cqw; background: linear-gradient(var(--cap), var(--cap-low)); padding: 0.42cqw 0.5cqw 0.34cqw; display: flex; flex-direction: column; overflow: hidden; }
+.lg { font-family: var(--font-cap); line-height: 1.12; white-space: pre; overflow: hidden; text-overflow: ellipsis; color: var(--c, var(--ink)); }
+.corner { font-weight: 600; }
+.main { margin-block: auto; text-align: center; font-weight: 600; }
+.subs { margin-top: auto; display: grid; }
+.sub { font-weight: 600; }
+.key.tint .face { background: linear-gradient(color-mix(in srgb, var(--c) 30%, var(--cap)), color-mix(in srgb, var(--c) 22%, var(--cap-low))); }
+.key.tint .cap { background: color-mix(in srgb, var(--c) 30%, var(--skirt)); }
+.key.dim .face { opacity: 0.42; }
+.key.held .cap { box-shadow: 0 0 0 0.24cqw var(--c); }
+.key:hover .cap { box-shadow: 0 0 0 0.16cqw color-mix(in srgb, var(--ink) 38%, transparent); }
+.key[aria-pressed="true"] .cap { box-shadow: 0 0 0 0.28cqw var(--accent); }
+.key:focus-visible { outline: none; }
+.key:focus-visible .cap { box-shadow: 0 0 0 0.32cqw var(--accent); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 20px; color: var(--muted); font-size: 0.92rem; }
+.chip { display: inline-flex; align-items: center; gap: 8px; }
+.chip i { width: 11px; height: 11px; border-radius: 3px; background: var(--c); }
+.chip.ring i { background: none; box-shadow: inset 0 0 0 2px var(--c); }
+.chip.dim i { background: color-mix(in srgb, var(--muted) 45%, transparent); }
+.detail { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 16px 22px; align-items: start; padding: 18px 20px; border: 1px solid var(--line); border-radius: 16px; }
+.big { display: grid; place-items: center; min-width: 3.4rem; height: 3.4rem; padding: 0 12px; border-radius: 10px; background: linear-gradient(var(--cap), var(--cap-low)); box-shadow: 0 3px 0 var(--skirt); font: 600 1.25rem/1 var(--font-cap); }
+.rows { display: grid; gap: 9px; min-width: 0; }
+.row { display: grid; grid-template-columns: 8.5rem minmax(0, 1fr); gap: 2px 14px; }
+.who { color: var(--c); font-weight: 600; }
+.what b { font-weight: 600; }
+.what code { font: 0.8rem var(--font-code); color: var(--muted); margin-left: 6px; overflow-wrap: anywhere; }
+.what em { color: var(--muted); }
+.foot { margin: 0; color: var(--muted); font-size: 0.85rem; }
+@media (max-width: 560px) { .row, .detail { grid-template-columns: minmax(0, 1fr); } }
+@media (prefers-reduced-motion: no-preference) { .cap, .face { transition: box-shadow .12s ease, background-color .12s ease; } }
+</style>
+"""
+
+HTML_BODY = r"""<main class="sheet">
+  <header class="top">
+    <div class="ident">
+      <h1 id="title"></h1>
+      <p class="asof" id="asof"></p>
+    </div>
+    <div class="seg" id="modes" role="group" aria-label="Mode switch on the keyboard"></div>
+  </header>
+  <nav class="tabs" id="tabs" role="tablist" aria-label="Layers"></nav>
+  <div class="board-scroll"><div class="board"><div class="keys" id="keys"></div></div></div>
+  <div class="legend" id="legend"></div>
+  <section class="detail" id="detail" aria-live="polite"></section>
+  <p class="foot" id="foot"></p>
+</main>
+<script>
+const MODEL = __MODEL__;
+(() => {
+  const M = MODEL, $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"})[c]);
+  const color = r => ({base: "var(--ink)", ink: "var(--ink)", dim: "var(--muted)", muted: "var(--muted)", accent: "var(--accent)"})[r] || `var(--${r})`;
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem("air60-keymap") || "{}"); } catch (e) {}
+  const remember = () => { try { localStorage.setItem("air60-keymap", JSON.stringify({mode: M.modes[modeI].name, view: viewI})); } catch (e) {} };
+  let modeI = M.modes.findIndex(m => m.name === (saved.mode || "Windows"));
+  if (modeI < 0) modeI = 0;
+  let viewI = Math.min(saved.view || 0, M.modes[modeI].views.length - 1);
+  const overviewKeys = () => M.modes[modeI].views[0].keys;
+  let selected = [...overviewKeys()].sort((a, b) => b.tip.length - a.tip.length)[0].i;
+
+  // Pick the most descriptive legend variant that fits, measuring the real font.
+  const ctx = document.createElement("canvas").getContext("2d");
+  const capFont = getComputedStyle(document.documentElement).getPropertyValue("--font-cap").trim();
+  const unit = 100 / M.board.w;  // one key unit in cqw
+  const SPEC = {corner: [1.32, 600, 1, 0.9], cornerSmall: [0.98, 500, 1, 0.9], main: [1.4, 600, 2, 0.75], sub: [1.06, 600, 1, 0.9]};
+  const measure = (text, weight, size) => { ctx.font = `${weight} 100px ${capFont}`; return ctx.measureText(text).width / 100 * size; };
+  function pick(variants, avail, [size, weight, maxLines, comfort]) {
+    const fits = (v, s) => { const lines = v.split("\n"); return lines.length <= maxLines && Math.max(...lines.map(l => measure(l, weight, s))) <= avail; };
+    const comfortable = size * comfort, smallest = size * 0.6;
+    for (const [low, high] of [[comfortable, size], [smallest, comfortable]]) {
+      for (const v of variants) for (let s = high; s >= low - 1e-6; s -= 0.04) if (fits(v, s)) return [v, s];
+    }
+    return [variants[variants.length - 1].replace(/-\n/g, "").replace(/\/\n/g, "/").replace(/\n/g, " "), smallest];
+  }
+
+  function keyHTML(k, overview) {
+    const avail = k.w * unit - 2.1;
+    let corner = "", main = "", subs = "";
+    for (const lg of k.legends) {
+      const spec = lg.slot === "corner" ? (overview ? SPEC.corner : SPEC.cornerSmall) : SPEC[lg.slot];
+      const [text, size] = pick(lg.v, avail, spec);
+      const fade = lg.slot === "corner" && !overview ? ";opacity:.6" : "";
+      const span = `<span class="lg ${lg.slot}" style="--c:${color(lg.role)};font-size:${size.toFixed(2)}cqw${fade}">${esc(text)}</span>`;
+      if (lg.slot === "corner") corner += span; else if (lg.slot === "main") main += span; else subs += span;
+    }
+    const cls = ["key", k.tint && "tint", k.dim && "dim", k.held && "held"].filter(Boolean).join(" ");
+    const label = k.tip.map(t => `${t.layer}: ${t.text}`).join(", ");
+    return `<button type="button" class="${cls}" data-i="${k.i}" aria-pressed="${k.i === selected}" aria-label="${esc(label)}"
+      style="--x:${k.x};--y:${k.y};--w:${k.w};--h:${k.h};--c:${color(k.tint || k.held || "ink")}"><span class="cap"></span><span class="face">${corner}${main}${subs && `<span class="subs">${subs}</span>`}</span></button>`;
+  }
+
+  function renderDetail() {
+    const k = overviewKeys().find(k => k.i === selected) || overviewKeys()[0];
+    $("detail").innerHTML = `<div class="big" aria-hidden="true">${esc(k.tip[0].text)}</div><div class="rows">` +
+      k.tip.map(t => `<div class="row" style="--c:${color(t.role)}"><span class="who">${esc(t.layer)}</span>` +
+        `<span class="what"><b>${esc(t.text)}</b> · ${esc(t.desc)}${t.note ? ` <em>(${esc(t.note)})</em>` : ""}<code>${esc(t.code)}</code></span></div>`).join("") + `</div>`;
+  }
+
+  function select(i) {
+    selected = i;
+    for (const b of $("keys").querySelectorAll("[data-i]")) b.setAttribute("aria-pressed", String(+b.dataset.i === i));
+    renderDetail();
+  }
+
+  function render() {
+    const mode = M.modes[modeI], view = mode.views[viewI];
+    $("title").textContent = M.board.name;
+    $("asof").textContent = M.source.asof;
+    $("modes").innerHTML = M.modes.map((m, i) => `<button type="button" data-mode="${i}" aria-pressed="${i === modeI}">${esc(m.name)}</button>`).join("");
+    $("tabs").innerHTML = mode.views.map((v, i) => `<button type="button" class="tab" role="tab" data-view="${i}" aria-selected="${i === viewI}" style="--c:${color(v.role)}">${esc(v.title)}${v.summary ? `<span class="sum">${esc(v.summary)}</span>` : ""}</button>`).join("");
+    const keys = $("keys");
+    keys.style.setProperty("--bw", M.board.w);
+    keys.style.setProperty("--bh", M.board.h);
+    keys.innerHTML = view.keys.map(k => keyHTML(k, view.id === "overview")).join("");
+    $("legend").innerHTML = view.chips.map(([r, t]) => `<span class="chip${t.startsWith("Outlined") ? " ring" : r === "dim" ? " dim" : ""}" style="--c:${color(r)}"><i></i>${esc(t)}</span>`).join("");
+    renderDetail();
+  }
+
+  $("modes").addEventListener("click", e => {
+    const b = e.target.closest("[data-mode]"); if (!b) return;
+    modeI = +b.dataset.mode; viewI = Math.min(viewI, M.modes[modeI].views.length - 1); remember(); render();
+  });
+  $("tabs").addEventListener("click", e => {
+    const b = e.target.closest("[data-view]"); if (!b) return;
+    viewI = +b.dataset.view; remember(); render();
+  });
+  $("tabs").addEventListener("keydown", e => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    const n = M.modes[modeI].views.length;
+    viewI = (viewI + (e.key === "ArrowRight" ? 1 : n - 1)) % n; remember(); render();
+    $("tabs").querySelector(`[data-view="${viewI}"]`).focus();
+  });
+  $("keys").addEventListener("click", e => { const b = e.target.closest("[data-i]"); if (b) select(+b.dataset.i); });
+  $("keys").addEventListener("mouseover", e => { const b = e.target.closest("[data-i]"); if (b && +b.dataset.i !== selected) select(+b.dataset.i); });
+  $("keys").addEventListener("focusin", e => { const b = e.target.closest("[data-i]"); if (b) select(+b.dataset.i); });
+
+  const made = new Date(M.generated);
+  $("foot").textContent = `Physical layout from NuPhy's VIA definition. Generated by nuphy-keymap on ${made.toLocaleDateString(undefined, {month: "short", day: "numeric", year: "numeric"})}.`;
+  render();
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(render);
+})();
+</script>
+"""
+
+
+def write_html(model: dict, path: Path, fragment: bool):
+    data = json.dumps(model, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    body = HTML_BODY.replace("__MODEL__", data)
+    if fragment:  # Claude artifacts wrap the page in their own <html>/<head>
+        page = HTML_HEAD + body
+    else:
+        page = ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+                '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
+                f"{HTML_HEAD}</head>\n<body>\n{body}</body>\n</html>\n")
+    path.write_text(page)
+
+
+# ---------------------------------------------------------------------------
+# Terminal output, sync and verify
+# ---------------------------------------------------------------------------
+
+def print_text(board: Board, km: Keymap, conns: list[str]):
+    model = build_model(board, km, conns)
+    print(f"{board.name}: {model['source']['headline']}")
+    if km.note:
+        print(f"  ({km.note})")
+    for mode in find_modes(board, km.layers):
+        print(f"\n=== {mode.name} ===")
+        base = mode.layers[0]
+        for info in mode.layers[1:]:
+            print(f"\n{info.name}" + (f"  ({info.summary})" if info.summary else ""))
+            cells = []
+            for k in board.keys:
+                code = km.layers[info.index][k.idx]
+                if code in TRANSPARENT:
+                    continue
+                lab = describe(code, board, km.macros)
+                if lab.link:
+                    lab = link_legend(lab, mode, False)[0]
+                pressed = flat(describe(km.layers[base.index][k.idx], board).variants[-1])
+                cells.append(f"{pressed:>6}  {flat(lab.variants[0])}")
+            for i in range(0, len(cells), 3):
+                print("  " + "".join(c.ljust(28) for c in cells[i:i + 3]).rstrip())
+
+
+def sync(board: Board, watch: bool):
+    if not watch:
+        layers, protocol = read_keyboard(board)
+        path, changed = save_snapshot(board, layers, protocol)
+        print(f"{'Saved a new snapshot' if changed else 'Unchanged; confirmed'}: {path}")
+        return
+    # Read when the cable goes in, right after VIA lets go of the keyboard (that's
+    # when edits are done), and every few minutes as a fallback. In between, only
+    # look at who has the device open, which costs about 10 ms.
+    time.sleep(2)  # let every USB interface finish appearing
+    next_read = 0.0  # monotonic time of the next read; 0 means as soon as possible
+    while dev := find_via_hidraw(board):
+        now = time.monotonic()
+        if processes_using(dev):
+            next_read = 0.0  # VIA is open: read as soon as it closes
+        elif now >= next_read:
+            try:
+                layers, protocol = read_keyboard(board)
+                if save_snapshot(board, layers, protocol)[1]:
+                    notify("Keymap change saved", "The keymap overlay now shows your latest VIA changes.")
+                next_read = now + WATCH_REREAD
+            except Busy:
+                pass  # VIA grabbed it in between; try again next round
+            except (OSError, TimeoutError, RuntimeError) as e:
+                print(f"read failed: {e}", file=sys.stderr)
+                next_read = now + 30
+        time.sleep(WATCH_POLL)
+
+
+def verify(board: Board, against: Path | None):
+    layers, protocol = read_keyboard(board)
+    if against:
+        ref = read_layout_file(against, board)
+    else:
+        ref = next((k for k in saved_keymaps(board) if k.source == "export"), None)
+        if ref is None:
+            sys.exit("No VIA export in via/ to compare with.")
+    print(f"Keyboard: {len(layers)} layers, VIA protocol {protocol}. Comparing with {ref.path.name}")
+    diffs = [(li, k, ref.layers[li][k.idx], layers[li][k.idx])
+             for li in range(min(len(layers), len(ref.layers))) for k in board.keys
+             if layers[li][k.idx] != ref.layers[li][k.idx]]
+    for li, k, old, new in diffs:
+        print(f"  layer {li}, key {k.idx:3}: file has {old}, keyboard has {new}")
+    if len(layers) != len(ref.layers):
+        print(f"  layer count differs: file {len(ref.layers)}, keyboard {len(layers)}")
+    print("Identical." if not diffs and len(layers) == len(ref.layers) else f"{len(diffs)} differences.")
+
+
+def main(argv: list[str] | None = None):
+    ap = argparse.ArgumentParser(prog="nuphy-keymap", description=__doc__.split("\n\n")[0],
+                                 epilog="\n\n".join(__doc__.split("\n\n")[1:]),
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--offline", action="store_true", help="don't query the keyboard, use the newest saved keymap")
+    sub = ap.add_subparsers(dest="cmd", metavar="command")
+    p_show = sub.add_parser("show", help="toggle the overlay (the default)")
+    p_show.add_argument("--screenshot", type=Path, help=argparse.SUPPRESS)
+    p_html = sub.add_parser("html", help="write the interactive web page")
+    p_html.add_argument("file", nargs="?", type=Path, default=HTML_FILE)
+    p_html.add_argument("--fragment", action="store_true", help="page content only, the way Claude artifacts take it")
+    p_html.add_argument("--no-open", action="store_true", help="don't open it in the browser")
+    sub.add_parser("text", help="print the layers in the terminal")
+    p_sync = sub.add_parser("sync", help="read the keyboard over USB and save a snapshot")
+    p_sync.add_argument("--watch", action="store_true", help="keep re-reading while it stays plugged in")
+    p_verify = sub.add_parser("verify", help="compare the live keyboard with a saved keymap")
+    p_verify.add_argument("file", nargs="?", type=Path)
+    args = ap.parse_args(argv)
+    cmd = args.cmd or "show"
+    shot = getattr(args, "screenshot", None)
+
+    if cmd == "show" and not shot and not claim_overlay():
+        return  # an overlay was open; the shortcut closed it
+    if not DEFINITION_FILE.exists():
+        sys.exit(f"Missing {DEFINITION_FILE}. Download NuPhy's VIA file for your keyboard from "
+                 f"{DEFINITIONS_URL} and save it there.")
+    board = load_board()
+    try:
+        if cmd == "sync":
+            return sync(board, args.watch)
+        if cmd == "verify":
+            return verify(board, args.file)
+        km = get_keymap(board, live=not args.offline)
+    except FileNotFoundError:
+        sys.exit("The keyboard isn't plugged in by USB, which VIA needs.")
+    except Busy as e:
+        sys.exit(f"{e} has the keyboard open. Close VIA and try again.")
+    conns = connections(board)
+    if cmd == "text":
+        return print_text(board, km, conns)
+    model = build_model(board, km, conns)
+    if cmd == "html":
+        write_html(model, args.file, args.fragment)
+        print(args.file)
+        if not args.no_open:
+            try:
+                subprocess.Popen(["xdg-open", str(args.file)], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError:
+                pass  # no xdg-open: the path printed above is enough
+        return
+    try:
+        run_overlay(model, shot)
+    except ImportError as e:
+        notify("NuPhy Keymap", f"The overlay needs PyQt6 ({e}). Try: nuphy-keymap html")
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit as e:
+        if isinstance(e.code, str) and not sys.stderr.isatty():
+            notify("NuPhy Keymap", e.code)  # launched from the shortcut: no terminal to print to
+        raise

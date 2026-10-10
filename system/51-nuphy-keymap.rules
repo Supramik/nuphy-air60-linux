@@ -1,0 +1,5 @@
+# Optional: when the NuPhy Air60 V2 is plugged in by USB, start the user service
+# nuphy-keymap-sync. While the cable stays in, it re-reads the keymap right after
+# VIA closes and every 5 minutes, so the snapshot (what the overlay shows over
+# Bluetooth) never goes stale. Installed by ./install.sh usb-hook.
+ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="19f5", ATTRS{idProduct}=="3255", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="nuphy-keymap-sync.service"

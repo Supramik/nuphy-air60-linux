@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=NuPhy Keymap
+GenericName=Keyboard Cheat Sheet
+Comment=Show what every key and layer on the NuPhy Air60 V2 does
+Exec="@BIN@/nuphy-keymap"
+Icon=input-keyboard
+Terminal=false
+Categories=Utility;
+Keywords=keyboard;keymap;layers;shortcuts;via;nuphy;air60;
+StartupNotify=false
+# Default global shortcuts: Meta+Shift+K from any keyboard, and F19, which only the
+# NuPhy sends once a key is mapped to it in VIA. Change them in System Settings >
+# Keyboard > Shortcuts > NuPhy Keymap.
+X-KDE-Shortcuts=Meta+Shift+K,F19

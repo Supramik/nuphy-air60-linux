@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Enable/disable the internal laptop keyboard ("AT Translated Set 2 keyboard"
+# on the i8042 KBD port).
+#
+# Usage: toggle-internal-keyboard [toggle|on|off|status]
+#          toggle  flip current state (default)
+#          on      enable, idempotent  — safe to call from the resume hook
+#          off     disable, idempotent
+#          status  print state; exits 0 if enabled, 1 if disabled (no root needed)
+#
+# Uses the serio port's drvctl interface rather than the driver-level
+# bind/unbind pair: a plain `unbind` is silently undone because this port's
+# bind_mode is "auto", so the serio core re-attaches atkbd immediately while the
+# write still reports success. We pin bind_mode to "manual" while disabled to
+# stop that, and verify the resulting state instead of trusting the write.
+#
+# Kernel-level, so it works under X11 and Wayland alike, and does not touch USB
+# or Bluetooth keyboards (NuPhy Air60, etc. are separate devices).
+set -euo pipefail
+
+PORT=/sys/devices/platform/i8042/serio0
+ACTION="${1:-toggle}"
+
+is_enabled() { [ -e "$PORT/driver" ]; }
+
+if [ ! -e "$PORT/drvctl" ]; then
+    echo "error: $PORT/drvctl not found — is this the right machine?" >&2
+    exit 1
+fi
+
+# status is read-only: handle it before demanding root.
+if [ "$ACTION" = "status" ]; then
+    if is_enabled; then echo "enabled"; exit 0; else echo "disabled"; exit 1; fi
+fi
+
+case "$ACTION" in
+    toggle|on|enable|off|disable) ;;
+    *) echo "usage: ${0##*/} [toggle|on|off|status]" >&2; exit 2 ;;
+esac
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "error: must run as root (try: sudo $0 $ACTION)" >&2
+    exit 1
+fi
+
+# Who should receive the desktop notification? Under sudo that's SUDO_USER;
+# when run from the systemd resume hook there is no SUDO_USER, so fall back to
+# whoever holds the current login session.
+notify_user() {
+    if [ -n "${SUDO_USER:-}" ]; then
+        printf '%s' "$SUDO_USER"
+    else
+        loginctl list-sessions --no-legend 2>/dev/null | awk 'NR==1 {print $3}'
+    fi
+}
+
+notify() {
+    local user uid
+    user=$(notify_user)
+    [ -n "$user" ] || return 0
+    uid=$(id -u "$user" 2>/dev/null) || return 0
+    sudo -u "$user" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+        notify-send -i input-keyboard "Internal keyboard" "$1" 2>/dev/null || true
+}
+
+kbd_disable() {
+    printf 'manual' > "$PORT/bind_mode"   # stop the serio core re-attaching atkbd
+    printf 'none'   > "$PORT/drvctl"      # detach the driver from the port
+}
+
+kbd_enable() {
+    printf 'auto'  > "$PORT/bind_mode"
+    printf 'atkbd' > "$PORT/drvctl"       # re-attach
+}
+
+case "$ACTION" in
+    toggle) if is_enabled; then intent=disabled; else intent=enabled; fi ;;
+    on|enable)   intent=enabled  ;;
+    off|disable) intent=disabled ;;
+esac
+
+# Idempotent: nothing to do, and no notification for a no-op. This is what keeps
+# the resume hook quiet on every normal wake.
+if { [ "$intent" = enabled ] && is_enabled; } || \
+   { [ "$intent" = disabled ] && ! is_enabled; }; then
+    echo "internal keyboard already $intent"
+    exit 0
+fi
+
+if [ "$intent" = disabled ]; then kbd_disable; else kbd_enable; fi
+
+# Verify: the driver symlink is ground truth, not the write's exit status.
+for _ in $(seq 10); do
+    if is_enabled; then actual=enabled; else actual=disabled; fi
+    [ "$actual" = "$intent" ] && break
+    sleep 0.1
+done
+
+if [ "$actual" != "$intent" ]; then
+    echo "error: tried to make the internal keyboard $intent, but it is still $actual" >&2
+    notify "FAILED — still ${actual}"
+    exit 1
+fi
+
+case "$actual" in
+    disabled) echo "internal keyboard disabled"; notify "Disabled" ;;
+    enabled)  echo "internal keyboard enabled";  notify "Enabled"  ;;
+esac

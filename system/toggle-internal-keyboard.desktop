@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Toggle Laptop Keyboard
+Comment=Turn the built-in laptop keyboard off or on
+Exec=sudo /usr/local/bin/toggle-internal-keyboard
+Icon=input-keyboard
+NoDisplay=true
+StartupNotify=false
+X-KDE-GlobalAccel-CommandShortcut=true
+X-KDE-Shortcuts=Meta+K
