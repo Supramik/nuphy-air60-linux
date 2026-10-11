@@ -6,13 +6,18 @@
   nuphy-keymap text          print every layer in the terminal
   nuphy-keymap sync          read the keyboard over USB and save a snapshot
   nuphy-keymap verify        compare the live keyboard with the newest VIA export
+  nuphy-keymap backups       list the saved keymaps, newest first
+  nuphy-keymap restore [N]   write saved keymap N back to the keyboard (asks first)
 
 Nothing about the keymap is hard-coded. Every run uses the freshest source:
 
-  1. the keyboard itself, read over USB with the VIA protocol. Read-only, and
-     possible without root thanks to the udev rule in system/50-nuphy.rules.
+  1. the keyboard itself, read over USB with the VIA protocol. Possible
+     without root thanks to the udev rule in system/50-nuphy.rules. Only
+     restore ever writes to it.
   2. the newest snapshot in snapshots/. Every live read refreshes it, so this
      is what you see over Bluetooth or the 2.4G dongle, which VIA can't reach.
+     Each snapshot is a VIA layout file with the macros too, so it doubles as
+     a backup: restore puts it back, and so does VIA's Load Saved Layout.
   3. a VIA export (Save + Load > Save Current Layout) dropped into via/.
 
 The physical layout and NuPhy's custom key names come from via/definition.json,
@@ -23,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import contextlib
 import datetime as dt
 import fcntl
 import html
@@ -30,6 +36,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -148,27 +155,36 @@ def saved_keymaps(board: Board):
             continue
 
 
-def save_snapshot(board: Board, layers: list[list[str]], protocol: int) -> tuple[Path, bool]:
-    """Store a live read. Returns (path, whether the keymap changed)."""
+def canonical(layers: list[list[str]]) -> list[list[str]]:
+    """Layers with one spelling per keycode, to compare files of different ages."""
+    return [[ALIASES.get(code, code) for code in layer] for layer in layers]
+
+
+def save_snapshot(board: Board, layers: list[list[str]], protocol: int,
+                  macros: list[str] | None = None) -> tuple[Path, bool]:
+    """Store a live read. Returns (path, whether the keymap changed). macros is
+    None when the keyboard couldn't be asked for them."""
     latest = next(saved_keymaps(board), None)
-    changed = latest is None or latest.layers != layers
+    changed = (latest is None or canonical(latest.layers) != canonical(layers)
+               or macros is not None and latest.macros != macros)
     if latest and latest.source == "snapshot" and not changed:
         os.utime(latest.path)  # same keymap: just mark it as confirmed now
         return latest.path, False
     SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    now = dt.datetime.now()
-    path = SNAPSHOT_DIR / f"keymap-{now:%Y-%m-%d_%H%M%S}.layout.json"
+    now = stamp = dt.datetime.now()
+    while (path := SNAPSHOT_DIR / f"keymap-{stamp:%Y-%m-%d_%H%M%S}.layout.json").exists():
+        stamp += dt.timedelta(seconds=1)  # restore saves one just before and one just after
+    note = {"read": f"live over USB, VIA protocol {protocol}", "at": now.isoformat(timespec="seconds")}
+    if macros is None and latest and latest.macros:
+        macros = latest.macros
+        note["macros"] = "carried over from the previous file, not read from the keyboard"
     data = {  # VIA's own layout format, plus a note on where it came from
         "name": board.name,
         "vendorProductId": board.vid << 16 | board.pid,
-        "macros": latest.macros if latest else [],
+        **({"macros": macros} if macros is not None else {}),  # VIA's Load skips them when missing
         "layers": layers,
         "encoders": [],
-        "_nuphy_keymap": {
-            "read": f"live over USB, VIA protocol {protocol}",
-            "at": now.isoformat(timespec="seconds"),
-            "macros": "carried over from the previous file, not read from the keyboard",
-        },
+        "_nuphy_keymap": note,
     }
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False) + "\n")
@@ -227,7 +243,8 @@ def processes_using(dev: Path) -> list[str]:
 
 
 class ViaLink:
-    """Minimal read-only VIA client: 32-byte raw HID reports over hidraw."""
+    """Minimal VIA client: 32-byte raw HID reports over hidraw. Everything but
+    restore only sends read requests."""
 
     def __init__(self, dev: Path):
         self.fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)
@@ -260,8 +277,20 @@ class ViaLink:
         raise TimeoutError("the keyboard didn't answer")
 
 
-def read_keyboard(board: Board) -> tuple[list[list[str]], int]:
-    """Read every layer straight from the keyboard. Returns (layers, VIA protocol)."""
+@dataclass
+class LiveKeymap:
+    """What one read over USB found on the keyboard."""
+    protocol: int  # VIA protocol version
+    codes: list[list[int]]  # 16-bit keycodes, one list per layer
+    layers: list[list[str]]  # the same, as VIA names them
+    macros: list[str] | None  # VIA's text for each macro; None if they couldn't be read
+    macro_size: int = 0  # bytes of macro memory
+
+
+@contextlib.contextmanager
+def via_session(board: Board):
+    """The keyboard's VIA interface, once nobody else (normally VIA in the
+    browser) has it open, and with no other nuphy-keymap using it meanwhile."""
     dev = find_via_hidraw(board)
     if dev is None:
         raise NotPluggedIn("not plugged in by USB")
@@ -272,31 +301,84 @@ def read_keyboard(board: Board) -> tuple[list[list[str]], int]:
             raise Busy(", ".join(sorted(set(users))))
         link = ViaLink(dev)
         try:
-            reply = link.ask(0x01)  # id_get_protocol_version
-            protocol = reply[1] << 8 | reply[2]
-            count = link.ask(0x11)[1]  # id_dynamic_keymap_get_layer_count
-            size = count * board.rows * board.cols * 2
-            raw = bytearray()
-            for offset in range(0, size, 28):  # id_dynamic_keymap_get_buffer, 28 bytes a time
-                n = min(28, size - offset)
-                reply = link.ask(0x12, offset >> 8, offset & 0xFF, n, echo=3)
-                raw += reply[4:4 + n]
+            yield link
         finally:
             link.close()
-    decode = keycode_decoder(protocol)
-    codes = [decode(raw[i] << 8 | raw[i + 1]) for i in range(0, len(raw), 2)]
+
+
+def read_state(link: ViaLink, board: Board) -> LiveKeymap:
+    reply = link.ask(0x01)  # id_get_protocol_version
+    protocol = reply[1] << 8 | reply[2]
+    count = link.ask(0x11)[1]  # id_dynamic_keymap_get_layer_count
+    size = count * board.rows * board.cols * 2
+    raw = bytearray()
+    for offset in range(0, size, 28):  # id_dynamic_keymap_get_buffer, 28 bytes a time
+        n = min(28, size - offset)
+        reply = link.ask(0x12, offset >> 8, offset & 0xFF, n, echo=3)
+        raw += reply[4:4 + n]
+    values = [raw[i] << 8 | raw[i + 1] for i in range(0, len(raw), 2)]
     per_layer = board.rows * board.cols
-    return [codes[i:i + per_layer] for i in range(0, len(codes), per_layer)], protocol
+    codes = [values[i:i + per_layer] for i in range(0, len(values), per_layer)]
+    decode = keycode_decoder(protocol)
+    macros, macro_size = read_macros(link, protocol)
+    return LiveKeymap(protocol, codes, [[decode(c) for c in layer] for layer in codes], macros, macro_size)
+
+
+def read_macros(link: ViaLink, protocol: int) -> tuple[list[str] | None, int]:
+    """Every macro as VIA's text, and the size of the macro memory. Reads only
+    as far as the last macro ends: one request while they're all empty. Macros
+    it can't get are None, so they never stand in the way of the keymap."""
+    try:
+        count = link.ask(0x0C)[1]  # id_dynamic_keymap_macro_get_count
+        reply = link.ask(0x0D)  # id_dynamic_keymap_macro_get_buffer_size
+        size = reply[1] << 8 | reply[2]
+        data = bytearray()
+        while (macros := decode_macros(data, count, protocol, final=len(data) >= size)) is None:
+            n = min(28, size - len(data))  # id_dynamic_keymap_macro_get_buffer, 28 bytes a time
+            reply = link.ask(0x0E, len(data) >> 8, len(data) & 0xFF, n, echo=3)
+            data += reply[4:4 + n]
+    except (RuntimeError, TimeoutError, ValueError):  # no dynamic macros, no answer, or not VIA's layout
+        return None, 0
+    return macros, size
+
+
+def read_keyboard(board: Board) -> LiveKeymap:
+    """Read every layer and macro straight from the keyboard."""
+    with via_session(board) as link:
+        return read_state(link, board)
+
+
+def write_keys(link: ViaLink, board: Board, keys: list[tuple[int, int, int]]):
+    """Set (layer, matrix index, keycode) one key at a time, the way VIA does when
+    you change a key. The keyboard echoes each request back once it's stored."""
+    for layer, idx, code in keys:
+        row, col = divmod(idx, board.cols)
+        link.ask(0x05, layer, row, col, code >> 8, code & 0xFF, echo=6)  # id_dynamic_keymap_set_keycode
+
+
+def write_macros(link: ViaLink, data: bytes, size: int):
+    """Replace the whole macro memory the way VIA does: clear it, mark the last
+    byte as a write in progress (the firmware won't play macros meanwhile),
+    write, then clear the mark."""
+    last = size - 1
+    link.ask(0x10, timeout=5)  # id_dynamic_keymap_macro_reset
+    link.ask(0x0F, last >> 8, last & 0xFF, 1, 0xFF, echo=5)  # id_dynamic_keymap_macro_set_buffer
+    try:
+        for offset in range(0, len(data), 28):
+            chunk = data[offset:offset + 28]
+            link.ask(0x0F, offset >> 8, offset & 0xFF, len(chunk), *chunk, echo=4 + len(chunk))
+    finally:
+        link.ask(0x0F, last >> 8, last & 0xFF, 1, 0x00, echo=5)
 
 
 def get_keymap(board: Board, live: bool = True) -> Keymap:
     note = ""
     if live:
         try:
-            layers, protocol = read_keyboard(board)
-            path, _ = save_snapshot(board, layers, protocol)
+            state = read_keyboard(board)
+            path, _ = save_snapshot(board, state.layers, state.protocol, state.macros)
             saved = read_layout_file(path, board)
-            return Keymap(layers, "usb", path, dt.datetime.now(), saved.macros)
+            return Keymap(state.layers, "usb", path, dt.datetime.now(), saved.macros)
         except NotPluggedIn:
             pass
         except Busy as e:
@@ -330,8 +412,20 @@ def connections(board: Board) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Keycodes: 16-bit values from the keyboard -> the names VIA uses in exports
+# Keycodes: 16-bit values from the keyboard <-> the names VIA uses in exports
 # ---------------------------------------------------------------------------
+# The names are VIA's own, because VIA's Load Saved Layout turns any name it
+# doesn't know into an empty key. With them, every key VIA can save itself comes
+# back when VIA loads a snapshot.
+
+def _runs(table: str) -> dict[int, str]:
+    """Consecutive keycodes: "7c10 KC_ASDN KC_ASUP" is 0x7C10 KC_ASDN, 0x7C11 KC_ASUP."""
+    out = {}
+    for line in table.strip().splitlines():
+        start, *names = line.split()
+        out.update({int(start, 16) + i: n for i, n in enumerate(names)})
+    return out
+
 
 def _basic_names(protocol: int) -> dict[int, str]:
     t = {0x00: "KC_NO", 0x01: "KC_TRNS"}
@@ -349,18 +443,24 @@ def _basic_names(protocol: int) -> dict[int, str]:
         0x4D: "KC_END", 0x4E: "KC_PGDN", 0x4F: "KC_RGHT", 0x50: "KC_LEFT", 0x51: "KC_DOWN",
         0x52: "KC_UP", 0x53: "KC_NLCK", 0x54: "KC_PSLS", 0x55: "KC_PAST", 0x56: "KC_PMNS",
         0x57: "KC_PPLS", 0x58: "KC_PENT", 0x62: "KC_P0", 0x63: "KC_PDOT", 0x64: "KC_NUBS",
-        0x65: "KC_APP", 0x66: "KC_POWER", 0x67: "KC_PEQL", 0x74: "KC_EXEC", 0x75: "KC_HELP",
-        0x76: "KC_MENU", 0x77: "KC_SLCT", 0x78: "KC_STOP", 0x79: "KC_AGIN", 0x7A: "KC_UNDO",
-        0x7B: "KC_CUT", 0x7C: "KC_COPY", 0x7D: "KC_PSTE", 0x7E: "KC_FIND",
+        0x65: "KC_APP", 0x66: "KC_POWER", 0x67: "KC_PEQL", 0x74: "KC_EXECUTE", 0x75: "KC_HELP",
+        0x76: "KC_MENU", 0x77: "KC_SELECT", 0x78: "KC_STOP", 0x79: "KC_AGAIN", 0x7A: "KC_UNDO",
+        0x7B: "KC_CUT", 0x7C: "KC_COPY", 0x7D: "KC_PASTE", 0x7E: "KC_FIND",
         0xA5: "KC_PWR", 0xA6: "KC_SLEP", 0xA7: "KC_WAKE", 0xA8: "KC_MUTE", 0xA9: "KC_VOLU",
         0xAA: "KC_VOLD", 0xAB: "KC_MNXT", 0xAC: "KC_MPRV", 0xAD: "KC_MSTP", 0xAE: "KC_MPLY",
         0xAF: "KC_MSEL", 0xB0: "KC_EJCT", 0xB1: "KC_MAIL", 0xB2: "KC_CALC", 0xB3: "KC_MYCM",
-        0xB4: "KC_WSCH", 0xB5: "KC_WHOM", 0xB6: "KC_WBAK", 0xB7: "KC_WFWD", 0xB8: "KC_WSTP",
-        0xB9: "KC_WREF", 0xBA: "KC_WFAV", 0xBB: "KC_MFFD", 0xBC: "KC_MRWD", 0xBD: "KC_BRIU",
-        0xBE: "KC_BRID",
+        0xB4: "KC_WWW_SEARCH", 0xB5: "KC_WWW_HOME", 0xB6: "KC_WWW_BACK", 0xB7: "KC_WWW_FORWARD",
+        0xB8: "KC_WWW_STOP", 0xB9: "KC_WWW_REFRESH", 0xBA: "KC_WWW_FAVORITES", 0xBB: "KC_MFFD",
+        0xBC: "KC_MRWD", 0xBD: "KC_BRIU", 0xBE: "KC_BRID",
         0xE0: "KC_LCTL", 0xE1: "KC_LSFT", 0xE2: "KC_LALT", 0xE3: "KC_LGUI",
         0xE4: "KC_RCTL", 0xE5: "KC_RSFT", 0xE6: "KC_RALT", 0xE7: "KC_RGUI",
     })
+    t.update(_runs("""
+        0082 KC_LCAP KC_LNUM KC_LSCR KC_PCMM KC_KP_EQUAL_AS400 KC_RO KC_KANA KC_JYEN KC_HENK KC_MHEN
+        008c KC_INT6 KC_INT7 KC_INT8 KC_INT9 KC_HAEN KC_HANJ KC_LANG3 KC_LANG4 KC_LANG5 KC_LANG6
+        0096 KC_LANG7 KC_LANG8 KC_LANG9 KC_ERAS KC_SYSREQ KC_CANCEL KC_CLR KC_PRIOR
+        00a0 KC_OUT KC_OPER KC_CLEAR_AGAIN KC_CRSEL KC_EXSEL
+    """))
     mouse = ["KC_MS_UP", "KC_MS_DOWN", "KC_MS_LEFT", "KC_MS_RIGHT",
              "KC_MS_BTN1", "KC_MS_BTN2", "KC_MS_BTN3", "KC_MS_BTN4", "KC_MS_BTN5"]
     wheel = ["KC_MS_WH_UP", "KC_MS_WH_DOWN", "KC_MS_WH_LEFT", "KC_MS_WH_RIGHT",
@@ -379,14 +479,78 @@ def _basic_names(protocol: int) -> dict[int, str]:
 _RGB = ["RGB_TOG", "RGB_MOD", "RGB_RMOD", "RGB_HUI", "RGB_HUD", "RGB_SAI", "RGB_SAD",
         "RGB_VAI", "RGB_VAD", "RGB_SPI", "RGB_SPD", "RGB_M_P", "RGB_M_B", "RGB_M_R",
         "RGB_M_SW", "RGB_M_SN", "RGB_M_K", "RGB_M_X", "RGB_M_G", "RGB_M_T", "RGB_M_TW"]
-_BACKLIGHT_V12 = ["BL_ON", "BL_OFF", "BL_TOGG", "BL_DOWN", "BL_UP", "BL_STEP", "BL_BRTG"]
-_BACKLIGHT_V10 = ["BL_ON", "BL_OFF", "BL_DOWN", "BL_UP", "BL_TOGG", "BL_STEP", "BL_BRTG"]
-NAMED_V12 = {0x7800 + i: n for i, n in enumerate(_BACKLIGHT_V12)}
-NAMED_V12.update({0x7820 + i: n for i, n in enumerate(_RGB)})
-NAMED_V12.update({0x7C00: "QK_BOOT", 0x7C01: "QK_REBOOT", 0x7C16: "QK_GESC"})
+_BACKLIGHT_V12 = ["BL_ON", "BL_OFF", "BL_TOGG", "BL_DEC", "BL_INC", "BL_STEP", "BL_BRTG"]
+_BACKLIGHT_V10 = ["BL_ON", "BL_OFF", "BL_DEC", "BL_INC", "BL_TOGG", "BL_STEP", "BL_BRTG"]
+NAMED_V11 = {0x7800 + i: n for i, n in enumerate(_BACKLIGHT_V12)}
+NAMED_V11.update({0x7820 + i: n for i, n in enumerate(_RGB)})
+NAMED_V11.update({0x7833: "RGB_MODE_RGBTEST", 0x7C00: "RESET", 0x7C01: "QK_REBOOT", 0x7C16: "KC_GESC"})
+NAMED_V11.update(_runs("""
+    7005 MAGIC_SWAP_LALT_LGUI MAGIC_UNSWAP_LALT_LGUI MAGIC_SWAP_RALT_RGUI MAGIC_UNSWAP_RALT_RGUI
+    7009 MAGIC_GUI_ON MAGIC_GUI_OFF MAGIC_TOGGLE_GUI
+    7013 MAGIC_TOGGLE_NKRO MAGIC_SWAP_ALT_GUI MAGIC_UNSWAP_ALT_GUI MAGIC_TOGGLE_ALT_GUI
+    7017 MAGIC_SWAP_LCTL_LGUI MAGIC_UNSWAP_LCTL_LGUI MAGIC_SWAP_RCTL_RGUI MAGIC_UNSWAP_RCTL_RGUI
+    701b MAGIC_SWAP_CTL_GUI MAGIC_UNSWAP_CTL_GUI MAGIC_TOGGLE_CTL_GUI MAGIC_EE_HANDS_LEFT
+    701f MAGIC_EE_HANDS_RIGHT
+    7100 MI_ON MI_OFF MI_TOG
+    7110 MI_C MI_Cs MI_D MI_Ds MI_E MI_F MI_Fs MI_G MI_Gs MI_A MI_As MI_B
+    7120 MI_C_1 MI_Cs_1 MI_D_1 MI_Ds_1 MI_E_1 MI_F_1 MI_Fs_1 MI_G_1 MI_Gs_1 MI_A_1 MI_As_1 MI_B_1
+    7130 MI_C_2 MI_Cs_2 MI_D_2 MI_Ds_2 MI_E_2 MI_F_2 MI_Fs_2 MI_G_2 MI_Gs_2 MI_A_2 MI_As_2 MI_B_2
+    7140 MI_C_3 MI_Cs_3 MI_D_3 MI_Ds_3 MI_E_3 MI_F_3 MI_Fs_3 MI_G_3 MI_Gs_3 MI_A_3 MI_As_3 MI_B_3
+    7150 MI_C_4 MI_Cs_4 MI_D_4 MI_Ds_4 MI_E_4 MI_F_4 MI_Fs_4 MI_G_4 MI_Gs_4 MI_A_4 MI_As_4 MI_B_4
+    7160 MI_C_5 MI_Cs_5 MI_D_5 MI_Ds_5 MI_E_5 MI_F_5 MI_Fs_5 MI_G_5 MI_Gs_5 MI_A_5 MI_As_5 MI_B_5
+    7170 MI_OCT_N2 MI_OCT_N1 MI_OCT_0 MI_OCT_1 MI_OCT_2 MI_OCT_3 MI_OCT_4 MI_OCT_5 MI_OCT_6 MI_OCT_7
+    717a MI_OCTD MI_OCTU
+    7180 MI_TRNS_N6 MI_TRNS_N5 MI_TRNS_N4 MI_TRNS_N3 MI_TRNS_N2 MI_TRNS_N1 MI_TRNS_0 MI_TRNS_1
+    7188 MI_TRNS_2 MI_TRNS_3 MI_TRNS_4 MI_TRNS_5 MI_TRNS_6 MI_TRNSD MI_TRNSU
+    7190 MI_VEL_0 MI_VEL_1 MI_VEL_2 MI_VEL_3 MI_VEL_4 MI_VEL_5 MI_VEL_6 MI_VEL_7 MI_VEL_8 MI_VEL_9
+    719a MI_VEL_10 MI_VELD MI_VELU
+    71a0 MI_CH1 MI_CH2 MI_CH3 MI_CH4 MI_CH5 MI_CH6 MI_CH7 MI_CH8 MI_CH9 MI_CH10 MI_CH11 MI_CH12
+    71ac MI_CH13 MI_CH14 MI_CH15 MI_CH16 MI_CHD MI_CHU
+    71c0 MI_ALLOFF MI_SUST MI_PORT MI_SOST MI_SOFT MI_LEG MI_MOD MI_MODSD MI_MODSU MI_BENDD MI_BENDU
+    7480 AU_ON AU_OFF AU_TOG
+    748a CLICKY_TOGGLE CLICKY_ENABLE CLICKY_DISABLE CLICKY_UP CLICKY_DOWN CLICKY_RESET
+    7490 MU_ON MU_OFF MU_TOG MU_MOD
+    7c02 DEBUG QK_CLEAR_EEPROM
+    7c10 KC_ASDN KC_ASUP KC_ASRP KC_ASON KC_ASOFF KC_ASTG
+    7c17 VLK_TOG KC_LCPO KC_RCPC KC_LSPO KC_RSPC KC_LAPO KC_RAPC KC_SFTENT
+    7c20 OUT_AUTO OUT_USB
+    7c40 HPT_ON HPT_OFF HPT_TOG HPT_RST HPT_FBK HPT_BUZ HPT_MODI HPT_MODD HPT_CONT HPT_CONI
+    7c4a HPT_COND HPT_DWLI HPT_DWLD
+    7c50 CMB_ON CMB_OFF CMB_TOG DYN_REC_START1 DYN_REC_START2 DYN_REC_STOP DYN_MACRO_PLAY1
+    7c57 DYN_MACRO_PLAY2
+"""))
+NAMED_V12 = NAMED_V11 | _runs("""
+    7840 RM_ON RM_OFF RM_TOGG RM_NEXT RM_PREV RM_HUEU RM_HUED RM_SATU RM_SATD RM_VALU RM_VALD
+    784b RM_SPDU RM_SPDD
+    7c77 FN_MO13 FN_MO23
+""")
+NAMED_V11.update({0x7700: "FN_MO13", 0x7701: "FN_MO23"})  # just below protocol 11's macros
 NAMED_V10 = {0x5CBB + i: n for i, n in enumerate(_BACKLIGHT_V10)}
 NAMED_V10.update({0x5CC2 + i: n for i, n in enumerate(_RGB)})
-NAMED_V10.update({0x5C00: "QK_BOOT"})
+NAMED_V10.update({0x5C00: "RESET", 0x5C16: "KC_GESC"})
+
+# QMK 0.19+ (VIA protocol 11 and 12): the layer keys, 32 layers each
+LAYER_KEYS = {"TO": 0x5200, "MO": 0x5220, "DF": 0x5240, "TG": 0x5260, "OSL": 0x5280, "TT": 0x52C0}
+# Modifier bits (bit 4 means right-hand) for VIA's LSFT(...) style functions and MOD_ masks
+MOD_FUNCTION_BITS = {
+    "LCTL": 0x01, "C": 0x01, "LSFT": 0x02, "S": 0x02, "LALT": 0x04, "A": 0x04, "LGUI": 0x08,
+    "LCMD": 0x08, "LWIN": 0x08, "G": 0x08, "RCTL": 0x11, "RSFT": 0x12, "ALGR": 0x14,
+    "RALT": 0x14, "RCMD": 0x18, "RWIN": 0x18, "RGUI": 0x18, "SCMD": 0x0A, "SWIN": 0x0A,
+    "SGUI": 0x0A, "LSG": 0x0A, "LAG": 0x0C, "RSG": 0x1A, "RAG": 0x1C, "LCA": 0x05,
+    "LSA": 0x06, "SAGR": 0x16, "RSA": 0x16, "RCS": 0x13, "LCAG": 0x0D, "MEH": 0x07, "HYPR": 0x0F,
+}
+MOD_MASK_BITS = {"MOD_LCTL": 0x01, "MOD_LSFT": 0x02, "MOD_LALT": 0x04, "MOD_LGUI": 0x08,
+                 "MOD_RCTL": 0x11, "MOD_RSFT": 0x12, "MOD_RALT": 0x14, "MOD_RGUI": 0x18,
+                 "MOD_HYPR": 0x0F, "MOD_MEH": 0x07}
+
+
+def _macro_custom(protocol: int) -> tuple[tuple[int, int], tuple[int, int]]:
+    """(first MACRO(n), how many), (first CUSTOM(n), how many), as VIA numbers them."""
+    if protocol >= 12:
+        return (0x7700, 128), (0x7E00, 256)
+    if protocol == 11:
+        return (0x7702, 16), (0x7F00, 256)
+    return (0x5F12, 16), (0x5F80, 16)
 
 
 def _mods(bits: int) -> list[str]:
@@ -397,61 +561,250 @@ def _mods(bits: int) -> list[str]:
 def keycode_decoder(protocol: int):
     """VIA protocol 11+ (QMK 0.19 and later) uses QMK's current numbering, though
     11 kept macros and custom keycodes higher up; older firmware uses the "v10"
-    layout. Unknown values come back as hex."""
+    layout. Values VIA has no name for come back as hex, which only nuphy-keymap
+    reads back."""
     basic = _basic_names(protocol)
     modern = protocol >= 11
-    macro, custom = (0x7700, 0x7E00) if protocol >= 12 else (0x7702, 0x7F00)
-
-    def kc(b: int) -> str:
-        return basic.get(b, f"0x{b:02x}")
+    named = NAMED_V12 if protocol >= 12 else NAMED_V11 if modern else NAMED_V10
+    (macro, macros), (custom, customs) = _macro_custom(protocol)
 
     def mask(bits: int) -> str:
-        return "|".join("MOD_" + m for m in _mods(bits)) or "0"
+        return "|".join("MOD_" + m for m in _mods(bits))
 
     def decode(code: int) -> str:
         if code in basic:
             return basic[code]
+        raw = f"0x{code:04x}"
+        kc = basic.get(code & 0xFF)  # the key inside LT(), MT() and LSFT()
         if 0x0100 <= code <= 0x1FFF:  # modifiers + key, e.g. LCTL(LSFT(KC_K))
-            name = kc(code & 0xFF)
-            for mod in reversed(_mods(code >> 8 & 0x1F)):
-                name = f"{mod}({name})"
-            return name
+            mods = _mods(code >> 8 & 0x1F)
+            if not mods or kc is None:
+                return raw
+            for mod in reversed(mods):
+                kc = f"{mod}({kc})"
+            return kc
         if 0x4000 <= code <= 0x4FFF:
-            return f"LT({code >> 8 & 0xF},{kc(code & 0xFF)})"
+            return f"LT({code >> 8 & 0xF},{kc})" if kc else raw
+        if macro <= code < macro + macros:
+            return f"MACRO({code - macro})"
+        if custom <= code < custom + customs:
+            return f"CUSTOM({code - custom})"
         if modern:
             if 0x2000 <= code <= 0x3FFF:
-                return f"MT({mask(code >> 8 & 0x1F)},{kc(code & 0xFF)})"
+                m = mask(code >> 8 & 0x1F)
+                return f"MT({m},{kc})" if m and kc else raw
             if 0x5000 <= code <= 0x51FF:
-                return f"LM({code >> 5 & 0xF},{mask(code & 0x1F)})"
-            for start, op in ((0x5200, "TO"), (0x5220, "MO"), (0x5240, "DF"),
-                              (0x5260, "TG"), (0x5280, "OSL"), (0x52C0, "TT")):
+                m = mask(code & 0x1F)
+                return f"LM({code >> 5 & 0xF},{m})" if m else raw
+            for op, start in LAYER_KEYS.items():
                 if start <= code < start + 0x20:
                     return f"{op}({code - start})"
             if 0x52A0 <= code <= 0x52BF:
-                return f"OSM({mask(code & 0x1F)})"
-            if macro <= code < macro + 0x20:
-                return f"MACRO({code - macro})"
-            if custom <= code < custom + 0x20:
-                return f"CUSTOM({code - custom})"
-            return NAMED_V12.get(code, f"0x{code:04x}")
+                m = mask(code & 0x1F)
+                return f"OSM({m})" if m else raw
+            return named.get(code, raw)
         if 0x6000 <= code <= 0x7FFF:
-            return f"MT({mask(code >> 8 & 0x1F)},{kc(code & 0xFF)})"
+            m = mask(code >> 8 & 0x1F)
+            return f"MT({m},{kc})" if m and kc else raw
         if 0x5000 <= code <= 0x50FF:
             return f"TO({code & 0xF})"
         ops = {0x51: "MO", 0x52: "DF", 0x53: "TG", 0x54: "OSL", 0x58: "TT"}
         if code >> 8 in ops:
             return f"{ops[code >> 8]}({code & 0x1F})"
         if 0x5500 <= code <= 0x55FF:
-            return f"OSM({mask(code & 0x1F)})"
+            m = mask(code & 0x1F)
+            return f"OSM({m})" if m else raw
         if 0x5900 <= code <= 0x59FF:
-            return f"LM({code >> 4 & 0xF},{mask(code & 0xF)})"
-        if 0x5F12 <= code < 0x5F22:
-            return f"MACRO({code - 0x5F12})"
-        if 0x5F80 <= code < 0x5FA0:
-            return f"CUSTOM({code - 0x5F80})"
-        return NAMED_V10.get(code, f"0x{code:04x}")
+            m = mask(code & 0xF)
+            return f"LM({code >> 4 & 0xF},{m})" if m else raw
+        return named.get(code, raw)
 
     return decode
+
+
+def keycode_encoder(protocol: int):
+    """The way back, for restore: a keycode as VIA's Load reads it, or the hex the
+    decoder falls back to, to its 16-bit value. Only for VIA protocols 11 and 12.
+    Raises ValueError instead of guessing."""
+    if protocol not in (11, 12):
+        raise ValueError(f"nuphy-keymap can't write keycodes for VIA protocol {protocol}")
+    names: dict[str, int] = {}
+    for code, name in (_basic_names(protocol) | (NAMED_V12 if protocol >= 12 else NAMED_V11)).items():
+        names.setdefault(ALIASES.get(name, name), code)  # older spellings match too
+    (macro, macros), (custom, customs) = _macro_custom(protocol)
+    numbered = {**{op: (start, 0x20) for op, start in LAYER_KEYS.items()},
+                "MACRO": (macro, macros), "CUSTOM": (custom, customs)}
+
+    def key(name: str) -> int:  # the plain key inside LT(), MT() and LSFT()
+        code = names.get(ALIASES.get(name.strip(), name.strip()))
+        if code is None or code > 0xFF:
+            raise ValueError(f"{name.strip()} can't go inside a key function")
+        return code
+
+    def mods(text: str) -> int:  # "MOD_LCTL | MOD_LSFT"
+        bits = 0
+        for part in text.split("|"):
+            if part.strip() not in MOD_MASK_BITS:
+                raise ValueError(f"unknown modifier {part.strip()!r}")
+            bits |= MOD_MASK_BITS[part.strip()]
+        return bits
+
+    def encode(name: str) -> int:
+        name = name.strip()
+        if (code := names.get(ALIASES.get(name, name))) is not None:
+            return code
+        if re.fullmatch(r"0[xX][0-9a-fA-F]{1,4}", name):
+            return int(name, 16)
+        if m := re.fullmatch(r"([A-Z]+)\((\d+)\)", name):
+            start, size = numbered.get(m[1], (0, 0))
+            if int(m[2]) < size:
+                return start + int(m[2])
+        elif m := re.fullmatch(r"LT\((\d+),(.+)\)", name):
+            if int(m[1]) < 16:
+                return 0x4000 | int(m[1]) << 8 | key(m[2])
+        elif m := re.fullmatch(r"MT\(([^,]+),(.+)\)", name):
+            return 0x2000 | mods(m[1]) << 8 | key(m[2])
+        elif m := re.fullmatch(r"LM\((\d+),(.+)\)", name):
+            if int(m[1]) < 16:
+                return 0x5000 | int(m[1]) << 5 | mods(m[2])
+        elif m := re.fullmatch(r"OSM\((.+)\)", name):
+            return 0x52A0 | mods(m[1])
+        else:  # modifiers around a key, nested or combined: LSFT(LGUI(KC_K)), LSG(KC_K)
+            bits, inner = 0, name
+            while (m := re.fullmatch(r"(\w+)\((.+)\)", inner)) and m[1] in MOD_FUNCTION_BITS:
+                bits |= MOD_FUNCTION_BITS[m[1]]
+                inner = m[2]
+            if bits:
+                return bits << 8 | key(inner)
+        raise ValueError(f"unknown keycode {name}")
+
+    return encode
+
+
+# ---------------------------------------------------------------------------
+# Macros: the keyboard's macro memory <-> the text VIA shows and saves
+# ---------------------------------------------------------------------------
+# The macros sit one after another, each ending in a 0 byte. Since VIA protocol
+# 11, a 1 starts an action: 1 1 kc taps a key, 1 2 kc presses it, 1 3 kc lets go
+# and 1 4 "100|" waits 100 ms; older firmware has 1 kc, 2 kc and 3 kc, and no
+# waits. Any other byte is a character to type. VIA saves them as text such as
+# "Hi{KC_ENT}", with {KC_LCTL,KC_C} for a chord, {+KC_LSFT} and {-KC_LSFT} for
+# press and release, and {100} for a wait. This follows VIA's own macro code,
+# so the same file means the same bytes here and in VIA.
+
+def decode_macros(data: bytes, count: int, protocol: int, final: bool = True) -> list[str] | None:
+    """The first `count` macros in the macro memory, as VIA's text. While `data`
+    stops partway through them, None (read more); with final, the ones it has."""
+    key = _basic_names(protocol).get
+    modern = protocol >= 11
+    macros: list[str] = []
+    steps: list[tuple[str, object]] = []
+    i = 0
+    while len(macros) < count:
+        if i >= len(data):
+            return macros if final else None
+        b = data[i]
+        if b == 0:
+            macros.append(_macro_text(steps))
+            steps, i = [], i + 1
+        elif (b == 1) if modern else (b in (1, 2, 3)):
+            action, at = (data[i + 1] if i + 1 < len(data) else -1, i + 2) if modern else (b, i + 1)
+            if action in (1, 2, 3) and at < len(data):
+                steps.append((("tap", "down", "up")[action - 1], key(data[at], f"0x{data[at]:02x}")))
+                i = at + 1
+            elif action == 4 and modern and (end := data.find(b"|", at)) >= 0:
+                digits = bytes(data[at:end])
+                if not digits.isdigit():
+                    raise ValueError("a macro wait that isn't a number")
+                steps.append(("wait", int(digits)))
+                i = end + 1
+            elif action in (-1, 1, 2, 3, 4):  # cut off by the end of what's been read
+                return macros if final else None
+            else:
+                raise ValueError(f"unknown macro action {action}")
+        else:
+            if steps and steps[-1][0] == "text":
+                steps[-1] = ("text", steps[-1][1] + chr(b))
+            else:
+                steps.append(("text", chr(b)))
+            i += 1
+    return macros
+
+
+def _macro_text(steps: list[tuple[str, object]]) -> str:
+    """VIA's text for one macro (its convertToTapsAndChords and sequenceToExpression):
+    keys pressed and then released in reverse order become one {chord}, and a
+    press straight before its own release becomes a tap."""
+    flat_steps = [s for kind, v in steps for s in ([("down", v), ("up", v)] if kind == "tap" else [(kind, v)])]
+    grouped, pending, held, unmatched = [], [], [], 0
+    for n, (kind, value) in enumerate(flat_steps):
+        keep = False
+        pending.append((kind, value))
+        if kind == "down" and unmatched == len(held):
+            held.append(value)
+            unmatched += 1
+            keep = True
+        elif kind == "up" and held and value == held[unmatched - 1]:
+            unmatched -= 1
+            if unmatched:
+                keep = True
+            else:
+                grouped.append(("tap", held[0]) if len(held) == 1 else ("chord", held))
+                pending = []
+        if not keep or n == len(flat_steps) - 1:
+            grouped += pending
+            pending, held, unmatched = [], [], 0
+    out, n = [], 0
+    while n < len(grouped):
+        kind, value = grouped[n]
+        if kind == "down" and n + 1 < len(grouped) and grouped[n + 1] == ("up", value):
+            kind, n = "tap", n + 1
+        n += 1
+        if kind == "text":
+            out.append(value.replace("{", "\\{"))
+        elif kind == "chord":
+            out.append("{" + ",".join(value) + "}")
+        else:
+            out.append("{" + {"tap": "", "down": "+", "up": "-", "wait": ""}[kind] + str(value) + "}")
+    return "".join(out)
+
+
+def encode_macros(texts: list[str], protocol: int) -> bytes:
+    """Macro text back to the bytes VIA would write for it (VIA's expressionToSequence
+    and rawKeycodeSequencesToMacroBytes). Raises ValueError for what the keyboard
+    can't hold. Only for VIA protocols 11 and 12."""
+    encode = keycode_encoder(protocol)
+    out = bytearray()
+    for n, text in enumerate(texts):
+        for part in re.split(r"(?<!\\)(\{.*?\})", text):
+            if not part:
+                continue
+            if not re.fullmatch(r"\{.*\}", part):  # characters to type
+                part = part.replace("\\{", "{")
+                if any(not 2 <= ord(ch) <= 0xFF for ch in part):
+                    raise ValueError(f"macro {n} types a character the keyboard can't: {part!r}")
+                out += part.encode("latin-1")
+                continue
+            inner = part[1:-1]
+            if re.fullmatch(r"[0-9]+", inner):
+                out += b"\x01\x04" + str(int(inner)).encode() + b"|"
+                continue
+            sign = inner[0] if inner[:1] in ("+", "-") else ""
+            keys = [k.strip().upper() for k in inner[len(sign):].split(",") if k.strip()]
+            codes = []
+            for k in keys:
+                if (code := encode(k)) > 0xFF:
+                    raise ValueError(f"macro {n}: {k} can't be used in a macro")
+                codes.append(code)
+            if sign and codes:
+                out += bytes([1, 2 if sign == "+" else 3, codes[0]])
+            elif len(codes) == 1:
+                out += bytes([1, 1, codes[0]])
+            elif codes:  # a chord: press them all, then let go in reverse
+                out += b"".join(bytes([1, 2, c]) for c in codes)
+                out += b"".join(bytes([1, 3, c]) for c in reversed(codes))
+        out.append(0)
+    return bytes(out)
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +970,11 @@ ALIASES = {
     "KC_BTN3": "KC_MS_BTN3", "KC_WH_U": "KC_MS_WH_UP", "KC_WH_D": "KC_MS_WH_DOWN",
     "KC_WH_L": "KC_MS_WH_LEFT", "KC_WH_R": "KC_MS_WH_RIGHT",
     "RGB_MODE_FORWARD": "RGB_MOD", "RGB_MODE_REVERSE": "RGB_RMOD", "KC_GESC": "QK_GESC",
-    "RESET": "QK_BOOT",
+    "RESET": "QK_BOOT", "BL_DEC": "BL_DOWN", "BL_INC": "BL_UP", "RGB_MODE_RGBTEST": "RGB_M_T",
+    "KC_EXECUTE": "KC_EXEC", "KC_SELECT": "KC_SLCT", "KC_AGAIN": "KC_AGIN", "KC_PASTE": "KC_PSTE",
+    "KC_WWW_SEARCH": "KC_WSCH", "KC_WWW_HOME": "KC_WHOM", "KC_WWW_BACK": "KC_WBAK",
+    "KC_WWW_FORWARD": "KC_WFWD", "KC_WWW_STOP": "KC_WSTP", "KC_WWW_REFRESH": "KC_WREF",
+    "KC_WWW_FAVORITES": "KC_WFAV", "KC_CLEAR": "KC_CLR",
 }
 
 MOD_WRAPPERS = {
@@ -961,6 +1318,17 @@ def notify(title: str, body: str):
                        check=False, stderr=subprocess.DEVNULL)
     except OSError:
         print(f"{title}: {body}", file=sys.stderr)
+
+
+def as_command(args: str) -> str:
+    """`nuphy-keymap ARGS` the way it can be typed in any folder: the bare name
+    only when that's on PATH, otherwise this script's own path."""
+    me = Path(__file__).resolve()
+    found = shutil.which("nuphy-keymap")
+    if found and Path(found).resolve() == me:
+        return f"nuphy-keymap {args}"
+    home = Path.home()
+    return f"{'~/' + str(me.relative_to(home)) if me.is_relative_to(home) else me} {args}"
 
 
 def kde_accent() -> str:
@@ -1636,8 +2004,8 @@ def print_text(board: Board, km: Keymap, conns: list[str]):
 
 def sync(board: Board, watch: bool):
     if not watch:
-        layers, protocol = read_keyboard(board)
-        path, changed = save_snapshot(board, layers, protocol)
+        state = read_keyboard(board)
+        path, changed = save_snapshot(board, state.layers, state.protocol, state.macros)
         print(f"{'Saved a new snapshot' if changed else 'Unchanged; confirmed'}: {path}")
         return
     # Read when the cable goes in, right after VIA lets go of the keyboard (that's
@@ -1651,9 +2019,10 @@ def sync(board: Board, watch: bool):
             next_read = 0.0  # VIA is open: read as soon as it closes
         elif now >= next_read:
             try:
-                layers, protocol = read_keyboard(board)
-                if save_snapshot(board, layers, protocol)[1]:
-                    notify("Keymap change saved", "The keymap overlay now shows your latest VIA changes.")
+                state = read_keyboard(board)
+                if save_snapshot(board, state.layers, state.protocol, state.macros)[1]:
+                    notify("Keymap backed up", "Your latest VIA changes are saved as a backup, "
+                           "and the keymap overlay shows them.")
                 next_read = now + WATCH_REREAD
             except Busy:
                 pass  # VIA grabbed it in between; try again next round
@@ -1672,16 +2041,215 @@ def verify(board: Board, against: Path | None):
         ref = next((k for k in saved_keymaps(board) if k.source == "export"), None)
         if ref is None:
             sys.exit("No VIA export in via/ to compare with.")
-    layers, protocol = read_keyboard(board)
-    print(f"Keyboard: {len(layers)} layers, VIA protocol {protocol}. Comparing with {ref.path.name}")
+    state = read_keyboard(board)
+    layers = state.layers
+    print(f"Keyboard: {len(layers)} layers, VIA protocol {state.protocol}. Comparing with {ref.path.name}")
     diffs = [(li, k, ref.layers[li][k.idx], layers[li][k.idx])
              for li in range(min(len(layers), len(ref.layers))) for k in board.keys
              if layers[li][k.idx] != ref.layers[li][k.idx]]
     for li, k, old, new in diffs:
         print(f"  layer {li}, key {k.idx:3}: file has {old}, keyboard has {new}")
+    macro_diffs = [(n, old, new) for n, (old, new) in enumerate(zip(ref.macros, state.macros or []))
+                   if old != new]
+    for n, old, new in macro_diffs:
+        print(f"  macro {n}: file has {old!r}, keyboard has {new!r}")
+    diffs += macro_diffs
     if len(layers) != len(ref.layers):
         print(f"  layer count differs: file {len(ref.layers)}, keyboard {len(layers)}")
     print("Identical." if not diffs and len(layers) == len(ref.layers) else f"{len(diffs)} differences.")
+
+
+# ---------------------------------------------------------------------------
+# Backups: list the saved keymaps, and write one back
+# ---------------------------------------------------------------------------
+
+def where(km: Keymap) -> str:
+    try:
+        return str(km.path.relative_to(DATA_DIR))
+    except ValueError:
+        return str(km.path)
+
+
+def changes_between(newer: Keymap, older: Keymap | None) -> str:
+    if older is None:
+        return "oldest"
+    keys = sum(a != b for la, lb in zip(canonical(newer.layers), canonical(older.layers))
+               for a, b in zip(la, lb))
+    parts = [f"{keys} key{'s' * (keys != 1)}"] if keys else []
+    if newer.macros and older.macros and newer.macros != older.macros:
+        parts.append("macros")
+    return ", ".join(parts) or "same keymap"
+
+
+def list_backups(board: Board):
+    kms = list(saved_keymaps(board))
+    if not kms:
+        sys.exit(f"No backups yet. Plug the keyboard in by USB and run: {as_command('sync')}")
+    print(f"Saved keymaps of your {board.name}, newest first:\n")
+    print("   #  Last seen         Changes from the one before  File")
+    for n, km in enumerate(kms, 1):
+        older = kms[n] if n < len(kms) else None
+        print(f"  {n:>2}  {km.when:%Y-%m-%d %H:%M}  {changes_between(km, older):<28} {where(km)}")
+    home = Path.home()
+    folder = f"~/{DATA_DIR.relative_to(home)}" if DATA_DIR.is_relative_to(home) else str(DATA_DIR)
+    print(f"\nEach is a VIA layout file with your layers and macros, in {folder}.\n"
+          f"To put one back, plug in USB and run: {as_command('restore NUMBER')}\n"
+          "It shows what changes and asks first. Or load the file in VIA: Save + Load > Load Saved Layout.")
+
+
+@dataclass
+class RestorePlan:
+    keys: list[tuple[int, int, int]]  # (layer, matrix index, keycode) for each key that changes
+    macro_bytes: bytes | None  # the new macro memory, if the macros change
+    notes: list[str]
+
+
+def plan_restore(state: LiveKeymap, km: Keymap) -> RestorePlan:
+    """What writing km to the keyboard would change. Raises ValueError, with the
+    reason, if it can't be written."""
+    encode = keycode_encoder(state.protocol)
+    if len(km.layers) > len(state.codes):
+        raise ValueError(f"it has {len(km.layers)} layers and the keyboard only {len(state.codes)}")
+    keys, bad = [], []
+    for li, layer in enumerate(km.layers):
+        for idx, name in enumerate(layer):
+            try:
+                code = encode(name)
+            except ValueError:
+                bad.append(f"{name} (layer {li}, key {idx})")
+                continue
+            if code != state.codes[li][idx]:
+                keys.append((li, idx, code))
+    if bad:
+        raise ValueError(f"it has keycodes nuphy-keymap can't write: {', '.join(bad[:5])}"
+                         + (f" and {len(bad) - 5} more" if len(bad) > 5 else ""))
+    notes, macro_bytes = [], None
+    if not km.macros:
+        if state.macros and any(state.macros):
+            notes.append("The backup has no macros, so the keyboard's stay as they are.")
+    elif state.macros is None:
+        if any(km.macros):
+            notes.append("The keyboard's macros couldn't be read, so the backup's are left out; "
+                         "VIA's Load Saved Layout can still put them back.")
+    elif len(km.macros) != len(state.macros):
+        raise ValueError(f"it has {len(km.macros)} macros and the keyboard room for {len(state.macros)}")
+    else:
+        data = encode_macros(km.macros, state.protocol)
+        if len(data) > state.macro_size:
+            raise ValueError(f"its macros take {len(data)} bytes and the keyboard has {state.macro_size}")
+        if decode_macros(data, len(km.macros), state.protocol) != state.macros:
+            macro_bytes = data
+    if len(km.layers) < len(state.codes):
+        notes.append(f"The backup has {len(km.layers)} of the keyboard's {len(state.codes)} layers; "
+                     "the others stay as they are.")
+    return RestorePlan(keys, macro_bytes, notes)
+
+
+def describe_changes(board: Board, state: LiveKeymap, km: Keymap, plan: RestorePlan) -> list[str]:
+    """One line per changed key: the layer, the key, and what it does before and after."""
+    layer_names: dict[int, tuple[str, int]] = {}  # layer -> (name, its base layer)
+    for mode in find_modes(board, km.layers):
+        for info in mode.layers:
+            layer_names.setdefault(info.index, (f"{mode.name} {info.name}", mode.layers[0].index))
+    physical = {k.idx for k in board.keys}
+    lines = []
+    for li, idx, _ in plan.keys:
+        name, base = layer_names.get(li, (f"Layer {li}", 0))
+        # name the key by what it types now, which is easy to check by pressing it
+        key = next((label for code in (state.layers[base][idx], km.layers[base][idx])
+                    if (label := flat(describe(code, board).variants[-1])) not in ("✕", "▽")), "")
+        if idx not in physical:
+            key = f"matrix {idx // board.cols},{idx % board.cols}"
+        old, new = (flat(describe(code, board, macros).variants[0]) for code, macros in
+                    ((state.layers[li][idx], state.macros or ()), (km.layers[li][idx], km.macros)))
+        words = {"▽": "transparent", "✕": "nothing"}
+        lines.append(f"  {name:<22} {key:<8} {words.get(old, old)}  →  {words.get(new, new)}")
+    return lines
+
+
+def restore(board: Board, choice: str | None, assume_yes: bool):
+    state = read_keyboard(board)
+    if state.protocol not in (11, 12):
+        sys.exit(f"The keyboard speaks VIA protocol {state.protocol}, and nuphy-keymap only writes 11 and 12. "
+                 "Load the backup in VIA instead: Save + Load > Load Saved Layout.")
+    backups = list(saved_keymaps(board))
+
+    def plan_for(km: Keymap) -> RestorePlan | str:
+        try:
+            return plan_restore(state, km)
+        except ValueError as e:
+            return str(e)
+
+    if choice is None:  # the newest backup that isn't what the keyboard has now
+        if not backups:
+            sys.exit("No backups yet. They're made each time nuphy-keymap reads the keyboard over USB.")
+        for km in backups:
+            plan = plan_for(km)
+            if isinstance(plan, str) or plan.keys or plan.macro_bytes is not None:
+                break
+        else:
+            print("Nothing to restore: the keyboard matches all your backups.")
+            return
+    elif choice.isdigit():
+        if not 1 <= int(choice) <= len(backups):
+            sys.exit(f"There's no backup {choice}; {as_command('backups')} lists {len(backups)}.")
+        km = backups[int(choice) - 1]
+        plan = plan_for(km)
+    else:
+        try:
+            km = read_layout_file(Path(choice), board)
+        except (ValueError, KeyError, TypeError) as e:
+            sys.exit(f"Can't restore {choice}: {e}")
+        plan = plan_for(km)
+    label = f"the backup from {km.when:%Y-%m-%d %H:%M} ({where(km)})"
+    if isinstance(plan, str):
+        sys.exit(f"Can't restore {label}: {plan}.")
+    if not plan.keys and plan.macro_bytes is None:
+        print(f"The keyboard already matches {label}.")
+        return
+
+    # Keep what's on the keyboard now, so this can be undone the same way
+    before, _ = save_snapshot(board, state.layers, state.protocol, state.macros)
+    parts = [f"{len(plan.keys)} key{'s' * (len(plan.keys) != 1)}"] if plan.keys else []
+    if plan.macro_bytes is not None:
+        parts.append("the macros")
+    what = " and ".join(parts)
+    print(f"Restoring {label} changes {what}:")
+    lines = describe_changes(board, state, km, plan)
+    print("\n".join(lines[:15]) + (f"\n  ... and {len(lines) - 15} more" if len(lines) > 15 else ""))
+    for note in plan.notes:
+        print(note)
+    print(f"What the keyboard has now is saved as {before.name}.")
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            sys.exit("Nothing written. Add --yes to write without asking.")
+        if input("Write it to the keyboard? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Nothing written.")
+            return
+
+    try:
+        with via_session(board) as link:
+            if read_state(link, board) != state:
+                sys.exit("The keyboard changed in the meantime, so nothing was written. Run restore again.")
+            write_keys(link, board, plan.keys)
+            if plan.macro_bytes is not None:
+                write_macros(link, plan.macro_bytes, state.macro_size)
+            after = read_state(link, board)
+    except (OSError, TimeoutError, RuntimeError) as e:
+        sys.exit(f"Writing to the keyboard failed: {e}. Run restore again to finish; "
+                 f"what it had before is saved as {before.name}.")
+    expected = [layer[:] for layer in state.codes]
+    for li, idx, code in plan.keys:
+        expected[li][idx] = code
+    expected_macros = (state.macros if plan.macro_bytes is None
+                       else decode_macros(plan.macro_bytes, len(state.macros), state.protocol))
+    path, _ = save_snapshot(board, after.layers, after.protocol, after.macros)
+    wrong = sum(a != b for la, lb in zip(after.codes, expected) for a, b in zip(la, lb))
+    if wrong or after.macros != expected_macros:
+        sys.exit(f"The keyboard didn't take all of it: {wrong} keys"
+                 + (" and the macros" if after.macros != expected_macros else "")
+                 + f" came out different. What it has now is in {path.name}, and what it had before in {before.name}.")
+    print(f"Done: {what} written, and read back from the keyboard to check.")
 
 
 def main(argv: list[str] | None = None):
@@ -1701,6 +2269,11 @@ def main(argv: list[str] | None = None):
     p_sync.add_argument("--watch", action="store_true", help="keep re-reading while it stays plugged in")
     p_verify = sub.add_parser("verify", help="compare the live keyboard with a saved keymap")
     p_verify.add_argument("file", nargs="?", type=Path)
+    sub.add_parser("backups", help="list the saved keymaps, newest first")
+    p_restore = sub.add_parser("restore", help="write a saved keymap back to the keyboard over USB")
+    p_restore.add_argument("backup", nargs="?", help="a number from the backups list, or a VIA layout "
+                           "file (default: the newest backup that differs from the keyboard)")
+    p_restore.add_argument("-y", "--yes", action="store_true", help="write without asking")
     args = ap.parse_args(argv)
     cmd = args.cmd or "show"
     shot = getattr(args, "screenshot", None)
@@ -1711,11 +2284,15 @@ def main(argv: list[str] | None = None):
         sys.exit(f"Missing {DEFINITION_FILE}. Download NuPhy's VIA file for your keyboard from "
                  f"{DEFINITIONS_URL} and save it there.")
     board = load_board()
+    if cmd == "backups":
+        return list_backups(board)
     try:
         if cmd == "sync":
             return sync(board, args.watch)
         if cmd == "verify":
             return verify(board, args.file)
+        if cmd == "restore":
+            return restore(board, args.backup, args.yes)
         km = get_keymap(board, live=not args.offline)
     except NotPluggedIn:
         sys.exit("The keyboard isn't plugged in by USB, which VIA needs.")
@@ -1723,6 +2300,8 @@ def main(argv: list[str] | None = None):
         sys.exit(f"{e} has the keyboard open. Close VIA and try again.")
     except FileNotFoundError as e:
         sys.exit(f"Can't find {e.filename}.")
+    except (TimeoutError, RuntimeError) as e:
+        sys.exit(f"The keyboard didn't answer as expected: {e}. Try again, or plug it in again first.")
     conns = connections(board)
     if cmd == "text":
         return print_text(board, km, conns)
