@@ -48,7 +48,7 @@ The shortcut runs the script from the folder you cloned, so leave it there. If y
 
 Then download NuPhy's VIA file for the Air60 V2 from [JSON files for NuPhy keyboards](https://nuphy.com/pages/json-files-for-nuphy-keyboards), the same file you load into VIA's Design tab, and save it as `~/.config/nuphy-air60/via/definition.json`. Plug the keyboard in by USB once so nuphy-keymap can read your layers.
 
-`./install.sh viewer` adds a launcher with the shortcuts. If you don't have one yet, it also installs a udev rule that lets your user open the keyboard over USB; VIA in the browser needs the same rule.
+`./install.sh viewer` adds a launcher with the shortcuts. If you don't have one yet, it also installs a udev rule that lets your user open the keyboard over USB; VIA in the browser needs the same rule. And it adds `nuphy`, a short command for the terminal, to `~/.local/bin`. If that folder isn't on your PATH yet, the installer shows the line to add to your shell's startup file.
 
 ### Use
 
@@ -60,15 +60,15 @@ Then download NuPhy's VIA file for the Air60 V2 from [JSON files for NuPhy keybo
 | <kbd>M</kbd> | Switch between Windows and Mac |
 | <kbd>Esc</kbd> or a click outside | Close |
 
-From a terminal, in the folder you cloned (`cd ~/Projects/nuphy-air60-linux` first):
+From a terminal (without the installer, `bin/nuphy-keymap` in the folder you cloned does the same as `nuphy`):
 
 ```sh
-bin/nuphy-keymap html     # the same view as an interactive web page
-bin/nuphy-keymap text     # every layer as text
-bin/nuphy-keymap sync     # read the keyboard and save a snapshot
-bin/nuphy-keymap verify   # compare the keyboard with your newest VIA export
-bin/nuphy-keymap backups  # list the saved keymaps (see Backups below)
-bin/nuphy-keymap restore  # write one back to the keyboard
+nuphy html     # the same view as an interactive web page
+nuphy text     # every layer as text
+nuphy sync     # read the keyboard and save a snapshot
+nuphy verify   # compare the keyboard with your newest VIA export
+nuphy backups  # list the saved keymaps (see Backups below)
+nuphy restore  # write one back to the keyboard
 ```
 
 ![The web page from nuphy-keymap html](docs/web-page.png)
@@ -85,15 +85,13 @@ While the keyboard is plugged in by USB, a small service re-reads the keymap abo
 
 Whenever nuphy-keymap reads the keyboard over USB and finds the keymap or macros changed, it saves the new version next to the old ones: every layer and every macro, in VIA's own layout format. With the USB hook above, that happens a few seconds after you close VIA, so you no longer need to save a layout from VIA after each change. The newest 25 are kept in `~/.config/nuphy-air60/snapshots/`.
 
-Again from the folder you cloned:
-
 ```sh
-bin/nuphy-keymap backups      # newest first, with how many keys changed from one to the next
-bin/nuphy-keymap restore      # write back the newest one that differs from the keyboard
-bin/nuphy-keymap restore 3    # or number 3 from the list, or any VIA layout file
+nuphy backups      # newest first, with how many keys changed from one to the next
+nuphy restore      # write back the newest one that differs from the keyboard
+nuphy restore 3    # or number 3 from the list, or any VIA layout file
 ```
 
-After an accidental reset, plug in by USB and run `restore`. The reset keymap gets saved as well, but `restore` skips it, since the keyboard already has it, and puts back the keymap you had before.
+After an accidental reset, plug in by USB and run `nuphy restore`. The reset keymap gets saved as well, but `restore` skips it, since the keyboard already has it, and puts back the keymap you had before.
 
 `restore` needs the USB cable, with VIA closed. Before it writes anything, it saves what the keyboard has now (so a restore can be undone the same way), lists every key it will change, and asks. Then it changes only those keys, rewrites the macros if they differ, and reads everything back to check. It writes keyboards with VIA protocol 11 or 12, which includes the Air60 V2.
 

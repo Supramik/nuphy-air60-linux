@@ -1321,12 +1321,13 @@ def notify(title: str, body: str):
 
 
 def as_command(args: str) -> str:
-    """`nuphy-keymap ARGS` the way it can be typed in any folder: the bare name
-    only when that's on PATH, otherwise this script's own path."""
+    """`nuphy-keymap ARGS` the way it can be typed in any folder: as nuphy once
+    ./install.sh viewer has put that on the PATH, otherwise by this script's path."""
     me = Path(__file__).resolve()
-    found = shutil.which("nuphy-keymap")
-    if found and Path(found).resolve() == me:
-        return f"nuphy-keymap {args}"
+    for name in ("nuphy", "nuphy-keymap"):
+        found = shutil.which(name)
+        if found and Path(found).resolve() == me:
+            return f"{name} {args}"
     home = Path.home()
     return f"{'~/' + str(me.relative_to(home)) if me.is_relative_to(home) else me} {args}"
 

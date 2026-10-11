@@ -461,7 +461,7 @@ class Backups(unittest.TestCase):
             hint = nk.as_command("restore 2")
         self.assertTrue(hint.endswith("bin/nuphy-keymap restore 2") and not hint.startswith("bin/"), hint)
         with mock.patch("shutil.which", return_value=str(ROOT / "bin" / "nuphy-keymap")):
-            self.assertEqual(nk.as_command("restore 2"), "nuphy-keymap restore 2")
+            self.assertEqual(nk.as_command("restore 2"), "nuphy restore 2")  # the short name wins
 
 
 class Errors(unittest.TestCase):
